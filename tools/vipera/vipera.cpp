@@ -400,7 +400,17 @@ int main(int argc, char ** argv) {
         std::printf("  clamped        %s\n", plan.reason.c_str());
     }
     std::printf("  threads        %d (physical cores)\n", threads);
-    std::printf("  flash attn     %s\n", quantized_kv ? "on (required by a quantized KV cache)" : "auto");
+    // Not forced on for a quantized KV cache. llama.cpp accepts one without it,
+    // and measured here forcing it on f16 lost 2% of prompt processing.
+    std::printf("  flash attn     auto\n");
+    if (quantized_kv) {
+        // The trade is memory for time, and it is a bad one for speed: the
+        // attention matmuls no longer read f16, so they go through a much slower
+        // path on CPU. Measured on Qwen2.5-1.5B Q4_K_M, 3557-token prompt, 4 threads:
+        // f16 140.5 t/s, q8_0 K+V 62.5, q8_0 K only 83.3.
+        std::printf("  kv cost        quantized KV buys RAM, not speed: 140 -> 62 t/s prompt\n");
+        std::printf("                 at 3.5k tokens on CPU (f16 vs q8_0 K+V)\n");
+    }
     // stdout is block-buffered when piped while stderr is not, so an error that
     // follows this block would otherwise appear before the plan it refers to.
     std::fflush(stdout);
@@ -417,7 +427,7 @@ int main(int argc, char ** argv) {
     cparams.n_threads_batch = (int32_t) threads;
     cparams.type_k = type_k;
     cparams.type_v = type_v;
-    cparams.flash_attn_type = quantized_kv ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_AUTO;
+    cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
     cparams.no_perf = true;
 
     CtxPtr ctx(llama_init_from_model(model.get(), cparams));
