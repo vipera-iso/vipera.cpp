@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <atomic>
 #include <unordered_map>
 #include <vector>
 
@@ -2627,4 +2628,17 @@ static ggml_backend_buffer_type_t ggml_backend_cpu_buffer_from_ptr_type(void) {
 ggml_backend_buffer_t ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size) {
     GGML_ASSERT((uintptr_t)ptr % TENSOR_ALIGNMENT == 0 && "buffer pointer must be aligned");
     return ggml_backend_buffer_init(ggml_backend_cpu_buffer_from_ptr_type(), ggml_backend_cpu_buffer_from_ptr_i, ptr, size);
+}
+
+// K-quant repack policy for the CPU backend. It sits in ggml-base because the CPU backend can be
+// loaded as a separate library at runtime (GGML_BACKEND_DL) - the front end sets the policy before
+// that library is loaded, and the backend picks it up when it decides whether to repack.
+static std::atomic<int> g_repack_kquants{-1};
+
+void ggml_backend_repack_kquants_set(int mode) {
+    g_repack_kquants.store(mode, std::memory_order_relaxed);
+}
+
+int ggml_backend_repack_kquants_get(void) {
+    return g_repack_kquants.load(std::memory_order_relaxed);
 }

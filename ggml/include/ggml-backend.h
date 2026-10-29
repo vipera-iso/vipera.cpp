@@ -458,6 +458,14 @@ extern "C" {
     GGML_API ggml_backend_buffer_t      ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size);
     GGML_API ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void);
 
+    // K-quant repack policy, read by the CPU backend when it decides whether to repack those
+    // types: -1 follow the tiled matmul (skipped while tiled runs, since tiled is faster and can
+    // only read the stock layout), 0 never, 1 always. It lives in ggml-base, not the CPU backend,
+    // because that backend can be a separately loaded library (GGML_BACKEND_DL) that the front end
+    // has to configure before it exists.
+    GGML_API void ggml_backend_repack_kquants_set(int mode);
+    GGML_API int  ggml_backend_repack_kquants_get(void);
+
 #ifdef  __cplusplus
 }
 #endif
