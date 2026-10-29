@@ -37,6 +37,13 @@ extern "C" {
     GGML_BACKEND_API void    ggml_numa_init(enum ggml_numa_strategy numa); // call once for better performance on NUMA systems
     GGML_BACKEND_API bool    ggml_is_numa(void); // true if init detected that system has >1 NUMA node
 
+    // whether the tiled K-quant matmul is on and usable on this build/machine (GGML_CPU_TILED_MM)
+    GGML_BACKEND_API bool    ggml_tiled_mm_enabled(void);
+
+    // allow repacking the K-quant weights: -1 follow the tiled matmul (skipped while tiled runs,
+    // since tiled is faster and can only read the stock layout), 0 never, 1 always
+    GGML_BACKEND_API void    ggml_cpu_set_repack_kquants(int mode);
+
     GGML_BACKEND_API struct ggml_tensor * ggml_new_i32(struct ggml_context * ctx, int32_t value);
     GGML_BACKEND_API struct ggml_tensor * ggml_new_f32(struct ggml_context * ctx, float value);
 

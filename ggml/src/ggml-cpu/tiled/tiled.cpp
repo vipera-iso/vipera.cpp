@@ -580,6 +580,17 @@ static bool ggml_tiled_matmul_enabled(void) {
     return enabled;
 }
 
+// public query (ggml-cpu.h): tiled is on and this build can run it. The loader asks this to
+// decide whether repacking K-quants is worth it - tiled reads the stock layout only, so a
+// repacked weight tensor silently falls back to the (slower) repack kernels.
+bool ggml_tiled_mm_enabled(void) {
+#if !defined(__AVX512VNNI__) && !defined(__AVX2__) && !defined(__AVX__)
+    return false;
+#else
+    return ggml_tiled_matmul_enabled();
+#endif
+}
+
 // GGML_CPU_TILED_MM_FORCE: test/bench only, take the tiled path even when unprofitable
 static bool ggml_tiled_matmul_forced(void) {
     static bool forced = false;
@@ -609,6 +620,7 @@ static bool ggml_tiled_supported(const struct ggml_tensor * src0,
     }
 
     // repack-buffer weights hold a repacked layout, let that kernel handle
+    // (the loader keeps weights out of repack buffers while tiled is on, see ggml_tiled_mm_enabled)
     if (src0->extra != NULL) {
         return false;
     }

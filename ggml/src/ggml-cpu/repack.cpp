@@ -11,6 +11,7 @@
 
 #include "arch-fallback.h"
 
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <cassert>
@@ -4922,7 +4923,40 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 
 }  // namespace ggml::cpu::repack
 
+// Whether the K-quant family may be repacked. tiled matmul handles those types and can only read
+// the stock layout, and it is the faster of the two, so repacking them is skipped while tiled is
+// on - otherwise the weights end up repacked and every K-quant matmul silently takes the repack
+// kernel instead (ggml_tiled_supported rejects repacked tensors). Auto (-1) follows tiled;
+// --repack forces 1 to get the old behaviour back for A/B runs.
+static std::atomic<int> g_repack_kquants{-1};
+
+static bool ggml_repack_kquant_allowed(void) {
+    const int mode = g_repack_kquants.load(std::memory_order_relaxed);
+    return mode < 0 ? !ggml_tiled_mm_enabled() : mode != 0;
+}
+
+static bool ggml_is_kquant(enum ggml_type type) {
+    switch (type) {
+        case GGML_TYPE_Q2_K:
+        case GGML_TYPE_Q3_K:
+        case GGML_TYPE_Q4_K:
+        case GGML_TYPE_Q5_K:
+        case GGML_TYPE_Q6_K:
+            return true;
+        default:
+            return false;
+    }
+}
+
+void ggml_cpu_set_repack_kquants(int mode) {
+    g_repack_kquants.store(mode, std::memory_order_relaxed);
+}
+
 static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(const struct ggml_tensor * cur) {
+    if (ggml_is_kquant(cur->type) && !ggml_repack_kquant_allowed()) {
+        return nullptr;
+    }
+
     // instance for Q1_0
     static const ggml::cpu::repack::tensor_traits<block_q1_0, 4, 4, GGML_TYPE_Q8_0> q1_0_4x4_q8_0;
     static const ggml::cpu::repack::tensor_traits<block_q1_0, 8, 4, GGML_TYPE_Q8_0> q1_0_4x8_q8_0;
