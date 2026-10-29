@@ -1,7 +1,7 @@
 #include "arg.h"
 
 #include "build-info.h"
-#include "ggml-cpu.h"
+#include "ggml-backend.h"
 #include "chat.h"
 #include "common.h"
 #include "download.h"
@@ -2432,7 +2432,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.no_extra_bufts = !value;
             // K-quants are the only types where repacking costs us the tiled kernel, so leave the
             // rest of the types alone and let this flag decide only that family
-            ggml_cpu_set_repack_kquants(value ? 1 : 0);
+            ggml_backend_repack_kquants_set(value ? 1 : 0);
         }
     ).set_env("LLAMA_ARG_REPACK"));
     add_opt(common_arg(
