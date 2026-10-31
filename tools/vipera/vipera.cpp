@@ -272,11 +272,15 @@ struct Options {
     int n_predict = 64;
     int threads = 0;            // 0 = physical cores
     int ngl = -1;               // -1 = fit the free VRAM, 0 = CPU only
+    int ubatch = 0;             // 0 = min(512, -b); the CPU side sizes the batch
+    int fit_target = 0;         // MiB kept free on the card; 0 = scale to its size
+    int n_cpu_ffn = 0;          // 0 = off; else this many layers read FFN from RAM
     float temp = 0.0f;          // 0 = greedy
     float top_p = 0.95f;
     float min_p = 0.05f;
     uint32_t seed = LLAMA_DEFAULT_SEED;
     bool plan_only = false;
+    int kv_mode = 0;            // 0 = KV cache on the card, -1 = in RAM (-nkvo)
     // Off by default: a warmup decode costs 8% of every later token on CUDA
     // (91.8 vs 99.3 t/s, same prompt). It exists for a clean prompt number.
     bool warmup = false;
@@ -292,15 +296,30 @@ void print_usage(const char * argv0) {
         "                  with -ngl 0 it defaults to the model's trained context)\n"
         "  -n N            tokens to generate (default 64)\n"
         "  -t N            threads (default: physical cores)\n"
+        "  -ub N           batch size for one pass (default 512, max 1024: a\n"
+        "                  larger batch needs compute buffers the card lacks;\n"
+        "                  1024 prefilled 1655 tokens at 88.0 t/s against 84.3)\n"
         "  -ngl N          layers on GPU; default fits the free VRAM (see --fit)\n"
         "  --fit on|off    place layers across GPU and RAM automatically (default on)\n"
+        "  --fit-target N  MiB the fit must leave free on the card (default: a\n"
+        "                  scaled one - card/8, at least 256, at most 512, where\n"
+        "                  upstream's fixed 1024 is 28%% of a 4 GB card)\n"
+        "  -nkvo           keep the KV cache in RAM instead of on the card; on a\n"
+        "                  partial split it buys layers (19/28 vs 17/28 at 8k on\n"
+        "                  a 4 GB card) and costs a bus read per attention step\n"
+        "  -ncffn N        attention of every layer on the card, FFN of the first\n"
+        "                  N layers read from RAM. Measured on a 4 GB card, 7B at\n"
+        "                  8k: 8 layers decoded 16.8 t/s against 11.4 for 17 whole\n"
+        "                  layers (+48%%). Bypasses the fit - the split cannot be\n"
+        "                  priced from a header - so pass -c; -ctk stays f16 only\n"
+        "                  when it fits, otherwise it is lowered to q8_0\n"
         "  -p TEXT         prompt (default \"The capital of France is\")\n"
         "  --kv TYPE       KV cache type for K and V (default f16)\n"
         "  -ctk/-ctv TYPE  set K and V separately\n"
         "  --temp/--top-p/--min-p/--seed   sampling (temp 0 = greedy, the default)\n"
         "  --plan          print the plan and exit (loads metadata only)\n"
         "  --warmup        decode one token first so the prompt number excludes\n"
-        "                  graph allocation (costs 8% of decode)\n"
+        "                  graph allocation (costs 8%% of decode)\n"
         "  --no-warmup     accepted for compatibility; it is the default\n"
         "  --verbose       forward llama.cpp's INFO log to stderr\n"
         "  -h, --help\n\n", argv0);
@@ -312,6 +331,7 @@ bool parse_args(int argc, char ** argv, Options & o) {
         const bool has_value = i + 1 < argc;
         if (a == "-h" || a == "--help") { o.help = true; return true; }
         else if (a == "--plan")     { o.plan_only = true; }
+        else if (a == "-nkvo" || a == "--no-kv-offload") { o.kv_mode = -1; }
         else if (a == "--warmup")   { o.warmup = true; }
         else if (a == "--no-warmup"){ o.warmup = false; }
         else if (a == "--verbose")  { g_verbose = true; }
@@ -320,6 +340,9 @@ bool parse_args(int argc, char ** argv, Options & o) {
         else if (a == "-c" && has_value) { o.ctx = std::atoi(argv[++i]); }
         else if (a == "-n" && has_value) { o.n_predict = std::atoi(argv[++i]); }
         else if (a == "-t" && has_value) { o.threads = std::atoi(argv[++i]); }
+        else if (a == "-ub" && has_value) { o.ubatch = std::atoi(argv[++i]); }
+        else if (a == "--fit-target" && has_value) { o.fit_target = std::atoi(argv[++i]); }
+        else if ((a == "-ncffn" || a == "--n-cpu-ffn") && has_value) { o.n_cpu_ffn = std::atoi(argv[++i]); }
         else if (a == "-ngl" && has_value) {
             const std::string v = argv[++i];
             // 'auto' spells the default; atoi("auto") would mean CPU-only.
@@ -391,6 +414,24 @@ double median(std::vector<double> v) {
     return n % 2 ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
 }
 
+// `-ncffn N` keeps every layer's attention (and its KV slice) on the card and
+// reads the FFN blocks of the first N layers from system RAM. The strings have
+// to outlive the load - llama.cpp holds the pattern pointers - so `keep` is the
+// owner, reserved by the caller before the first push_back.
+// The list is NULL-terminated and llama.cpp stops at the first empty pattern,
+// so the entries are filled in place - pushing back would append after the
+// terminator and never be read.
+bool add_ffn_cpu_override(std::vector<std::string> & keep,
+                          std::vector<llama_model_tensor_buft_override> & overrides,
+                          size_t idx, int layer) {
+    if (idx + 1 >= overrides.size()) {
+        return false;
+    }
+    keep.push_back("blk\\." + std::to_string(layer) + "\\.ffn_(up|down|gate)\\.");
+    overrides[idx] = {keep.back().c_str(), ggml_backend_cpu_buffer_type()};
+    return true;
+}
+
 double percentile(std::vector<double> v, double q) {
     if (v.empty()) {
         return 0.0;
@@ -411,6 +452,16 @@ int main(int argc, char ** argv) {
     if (opt.help) {
         print_usage(argv[0]);
         return 0;
+    }
+
+    const bool ffn_split = opt.n_cpu_ffn > 0;
+    // f16 at 8k asks for 448 MiB beside every layer's attention; 224 with q8_0
+    // is what let 8 FFN blocks fit on the reference 4 GB card (18.2 t/s against
+    // a failure to create the context). Only when the KV type was left alone.
+    bool kv_lowered = false;
+    if (ffn_split && opt.kv_k == "f16" && opt.kv_v.empty()) {
+        opt.kv_k = opt.kv_v = "q8_0";
+        kv_lowered = true;
     }
 
     bool kv_ok = false;
@@ -440,9 +491,75 @@ int main(int argc, char ** argv) {
     // mparams, and llama.cpp dereferences them while the model is loaded.
     std::vector<float> tensor_split(llama_max_devices(), 0.0f);
     std::vector<llama_model_tensor_buft_override> overrides(llama_max_tensor_buft_overrides());
-    std::vector<size_t> margins(llama_max_devices(), 1024 * MIB);
+    // Reserved up front: push_back must not move the strings after a pattern
+    // pointer has been handed to llama.cpp.
+    std::vector<std::string> override_patterns;
+    if (ffn_split) {
+        override_patterns.reserve((size_t) opt.n_cpu_ffn);
+    }
+    // A fixed 1 GiB margin is 28% of a 4 GB card and 4 more layers left on the
+    // CPU. Scale it to the card, with a floor for the driver's own allocations.
+    const size_t margin = opt.fit_target > 0
+                              ? (size_t) opt.fit_target * MIB
+                              : std::min(DEFAULT_HEADROOM, std::max(256 * MIB, device.total / 8));
+    std::vector<size_t> margins(llama_max_devices(), margin);
 
-    if (auto_placement) {
+    if (ffn_split && !device.present) {
+        std::fprintf(stderr, "error: -ncffn needs a GPU device; this build has none\n");
+        llama_backend_free();
+        return 1;
+    } else if (ffn_split) {
+        // Whole layers put the attention of 17 of 28 on the card and read the
+        // other 11 - attention included - over the bus on every token. This
+        // keeps the attention (and therefore the whole KV cache) on the card
+        // and pays the bus only for FFN blocks. Measured on the reference
+        // 4 GB card, 7B Q4_K_M at 8k, 1655-token prompt: 17 whole layers 11.4
+        // t/s, 8 FFN in RAM 16.8 t/s (+48%), 7 FFN 16.8-17.8 (+52%), 6 FFN does
+        // not fit. The fit is bypassed: it aborts when overrides are preset,
+        // and a header cannot price a tensor split anyway.
+        int applied = 0;
+        for (int il = 0; il < opt.n_cpu_ffn; ++il) {
+            // One slot is kept for the terminator.
+            if (!add_ffn_cpu_override(override_patterns, overrides, (size_t) applied, il)) {
+                break;
+            }
+            ++applied;
+        }
+        if (applied < opt.n_cpu_ffn) {
+            std::fprintf(stderr,
+                         "error: this build holds %zu tensor overrides, so -ncffn caps at %d\n",
+                         overrides.size() - 1, applied);
+            llama_backend_free();
+            return 1;
+        }
+        model_params.tensor_buft_overrides = overrides.data();
+        model_params.n_gpu_layers = -1;
+        opt.ngl = -1;
+        if (opt.ctx == 0) {
+            // Nothing fitted a context here, and the trained maximum assumes a
+            // cache that fits beside 28 layers' attention on this card.
+            opt.ctx = 8192;
+        }
+    } else if (auto_placement && !device.present) {
+        // With no GPU device the fitter reports success and leaves
+        // `n_gpu_layers` at its default, -1, which is llama.cpp's "all layers".
+        // Reading that as a full offload made a CPU-only box print "28/28, the
+        // whole model fits the card" and charge the KV cache to a card that is
+        // not there. Nothing to fit: say zero and keep every layer in RAM.
+        model_params.n_gpu_layers = 0;
+        opt.ngl = 0;
+        fit_failed = true;
+    } else if (auto_placement) {
+        // The fit only moves parameters that still hold their default, so this
+        // decides the KV device before it runs - and since the fitter prices the
+        // cache where it is told to put it, one pass is enough: `-nkvo` frees
+        // the card of the cache up front and the layers it buys are part of the
+        // same answer. Taking the cache off the card buys layers (19/28 against
+        // 17/28 at 8k on the reference card) but pays for them on every
+        // attention read: 9.3-10.3 t/s against 10.8 with the cache in VRAM. It
+        // wins only on a split deep enough for the layers to pay the transfers,
+        // so it stays opt-in.
+        cparams.offload_kqv = opt.kv_mode >= 0;
         // llama.cpp's own fitter, given the tensor map, decides what the card
         // can hold: it costs one metadata-only load and it is the difference
         // between "28/28" and a guess that OOMs on a card with a desktop on it.
@@ -485,8 +602,12 @@ int main(int argc, char ** argv) {
     // holds the whole model, so it means "all", not "none".
     const int gpu_layers = opt.ngl < 0 ? n_layer : std::min(opt.ngl, n_layer);
     // Per-layer bytes are the model's average; the non-repeating tensors ride
-    // along in RAM either way, so this charges them to the CPU side.
-    const size_t resident = model_bytes * (size_t) (n_layer - gpu_layers) / (size_t) n_layer;
+    // along in RAM either way, so this charges them to the CPU side. With
+    // `-ncffn` the layer index no longer says where its weights are: those N
+    // layers keep only their attention on the card, so they are charged whole,
+    // which errs on the side of a smaller context.
+    const int ram_layers = n_layer - gpu_layers + (ffn_split ? std::min(opt.n_cpu_ffn, n_layer) : 0);
+    const size_t resident = model_bytes * (size_t) std::max(0, ram_layers) / (size_t) n_layer;
     const int requested = opt.ctx > 0 ? opt.ctx : (int) fitted_ctx;
     const Plan plan = make_plan(model.get(), requested, type_k, type_v, heads, resident, available,
                                 (int) fitted_ctx);
@@ -505,8 +626,14 @@ int main(int argc, char ** argv) {
     } else {
         std::printf("  gpu            none (CPU only)\n");
     }
-    if (!auto_placement) {
+    if (ffn_split) {
+        std::printf("  gpu layers     %d/%d (attention of all, FFN of %d from RAM)\n",
+                    n_layer, n_layer, opt.n_cpu_ffn);
+    } else if (!auto_placement) {
         std::printf("  gpu layers     %d/%d (given by -ngl)\n", gpu_layers, n_layer);
+    } else if (!device.present) {
+        std::printf("  gpu layers     0/%d (no GPU device in this build or on this machine)\n",
+                    n_layer);
     } else if (fit_failed) {
         std::printf("  gpu layers     0/%d (nothing fit the card; every layer stays in RAM)\n",
                     n_layer);
@@ -517,13 +644,26 @@ int main(int argc, char ** argv) {
                     gpu_layers, n_layer);
     }
     std::printf("  ram weights    ~%zu MiB of the model stays in system RAM\n", resident / MIB);
+    if (ffn_split) {
+        std::printf("  ffn on cpu     %d of %d layers read their FFN blocks from RAM\n",
+                    opt.n_cpu_ffn, n_layer);
+    }
     std::printf("  kv cache       %zu MiB at %d tokens (%s/%s)\n",
                 plan.kv / MIB, plan.ctx, opt.kv_k.c_str(),
                 (opt.kv_v.empty() ? opt.kv_k : opt.kv_v).c_str());
-    if (gpu_layers > 0) {
+    if (kv_lowered) {
+        std::printf("  kv lowered     f16 did not fit beside the split, so q8_0 halves it\n");
+    }
+    if (!cparams.offload_kqv) {
+        std::printf("  kv location    all %zu MiB in RAM, the card keeps its layers\n",
+                    plan.kv / MIB);
+    } else if (gpu_layers > 0) {
         // llama.cpp keeps the cache of an offloaded layer on that device.
         std::printf("  kv on gpu      ~%zu MiB for %d of %d layers, the rest in RAM\n",
                     plan.kv * (size_t) gpu_layers / (size_t) n_layer / MIB, gpu_layers, n_layer);
+    }
+    if (device.present) {
+        std::printf("  headroom       %zu MiB of the card kept free for the driver\n", margin / MIB);
     }
     std::printf("  available      %zu MiB\n", available / MIB);
     std::printf("  context        %d requested, %d used (train limit %d)\n",
@@ -553,7 +693,10 @@ int main(int argc, char ** argv) {
 
     cparams.n_ctx = (uint32_t) plan.ctx;
     cparams.n_batch = std::min<uint32_t>(2048u, (uint32_t) plan.ctx);
-    cparams.n_ubatch = std::min<uint32_t>(512u, cparams.n_batch);
+    // 2048 on the reference 4 GB card asks for a 1.36 GB compute buffer and the
+    // context fails to create, so the ceiling is 1024 whatever the flag asks.
+    const uint32_t ubatch = std::min<uint32_t>(opt.ubatch > 0 ? (uint32_t) opt.ubatch : 512u, 1024u);
+    cparams.n_ubatch = std::min<uint32_t>(ubatch, cparams.n_batch);
     cparams.n_threads = (int32_t) threads;
     cparams.n_threads_batch = (int32_t) threads;
     cparams.type_k = type_k;
@@ -561,9 +704,37 @@ int main(int argc, char ** argv) {
     cparams.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_AUTO;
     cparams.no_perf = true;
 
-    CtxPtr ctx(llama_init_from_model(model.get(), cparams));
+    // The prefill compute buffer lives on the card as well, and `-ncffn` has
+    // already filled it with every layer's attention plus the KV cache: at 8k
+    // on the reference 4 GB card a 512-token ubatch asked for 333 MiB that
+    // were not there, while 256 tokens fit. Walk it down instead of failing.
+    std::vector<uint32_t> ubatches = {cparams.n_ubatch};
+    if (ffn_split) {
+        for (uint32_t u : {(uint32_t) 256, (uint32_t) 128}) {
+            if (u < cparams.n_ubatch) {
+                ubatches.push_back(u);
+            }
+        }
+    }
+    CtxPtr ctx(nullptr);
+    for (uint32_t ub : ubatches) {
+        cparams.n_ubatch = std::min<uint32_t>(ub, cparams.n_batch);
+        ctx.reset(llama_init_from_model(model.get(), cparams));
+        if (ctx) {
+            if (ub != ubatches.front()) {
+                std::printf("  ubatch         %u (lowered: the card had no room for a %u-token prefill buffer)\n",
+                            cparams.n_ubatch, ubatches.front());
+            }
+            break;
+        }
+    }
     if (!ctx) {
-        std::fprintf(stderr, "error: cannot create a context (%d tokens)\n", plan.ctx);
+        std::fprintf(stderr, "error: cannot create a context (%d tokens)", plan.ctx);
+        if (ffn_split) {
+            std::fprintf(stderr,
+                         "; free VRAM with a larger -ncffn, a smaller -c, or a quantized -ctk/-ctv");
+        }
+        std::fprintf(stderr, "\n");
         llama_backend_free();
         return 1;
     }
