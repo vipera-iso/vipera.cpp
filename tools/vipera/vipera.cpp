@@ -1,5 +1,6 @@
-// vipera: a llama.cpp runtime that sizes the KV cache against the machine's real
-// RAM before it allocates a context, then reports what the run actually cost.
+// vipera: a llama.cpp runtime that places the model across the GPU, the CPU and
+// RAM before it loads a weight, sizes the KV cache against the RAM that is left,
+// then reports what the run actually cost.
 //
 // Why this file exists instead of a wrapper script: llama-cli silently accepts a
 // context larger than RAM and pages; it also prints "0.0 t/s" when a prompt does
@@ -10,6 +11,8 @@
 
 #include "llama.h"
 #include "ggml.h"
+#include "ggml-backend.h"
+#include "fit.h"
 
 #include <algorithm>
 #include <chrono>
@@ -175,6 +178,36 @@ size_t kv_bytes_per_token(const llama_model * model, ggml_type type_k, ggml_type
     return per_token;
 }
 
+// ------------------------------------------------------------------ device ---
+
+struct Device {
+    std::string name;
+    size_t free = 0;
+    size_t total = 0;
+    bool present = false;
+};
+
+// The card the fit will fill. Read from ggml's device registry, not from a
+// vendor CLI: whatever backend this binary was built with is what it reports.
+Device first_gpu() {
+    Device d;
+    for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+        ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+        if (ggml_backend_dev_type(dev) != GGML_BACKEND_DEVICE_TYPE_GPU) {
+            continue;
+        }
+        size_t free_bytes = 0;
+        size_t total_bytes = 0;
+        ggml_backend_dev_memory(dev, &free_bytes, &total_bytes);
+        d.name = ggml_backend_dev_description(dev);
+        d.free = free_bytes;
+        d.total = total_bytes;
+        d.present = true;
+        break;
+    }
+    return d;
+}
+
 // ------------------------------------------------------------------- plan ----
 
 struct Plan {
@@ -186,8 +219,13 @@ struct Plan {
     std::string reason;
 };
 
+// `resident` is the weight bytes that live in system RAM: the layers the GPU
+// did not take, plus the non-repeating tensors. Charging the whole file to RAM
+// after offloading would under-count the context a hybrid run can afford.
+// `cap` is the context the placement was fitted for (0 = no cap): asking for
+// more tokens than that would put KV back into VRAM the layers already filled.
 Plan make_plan(const llama_model * model, int requested, ggml_type type_k, ggml_type type_v,
-               const std::vector<int> & heads, size_t model_bytes, size_t available) {
+               const std::vector<int> & heads, size_t resident, size_t available, int cap) {
     Plan p{};
     p.per_token = kv_bytes_per_token(model, type_k, type_v, heads);
 
@@ -199,9 +237,15 @@ Plan make_plan(const llama_model * model, int requested, ggml_type type_k, ggml_
         p.limited_by_train = true;
         p.reason = "the model was trained for fewer tokens";
     }
+    if (cap > 0 && p.ctx > cap) {
+        p.ctx = cap;
+        p.clamped = true;
+        p.limited_by_train = false;
+        p.reason = "the card cannot hold a larger KV cache beside the layers it took";
+    }
 
     if (available > 0 && p.per_token > 0) {
-        const long long budget = (long long) available - (long long) model_bytes -
+        const long long budget = (long long) available - (long long) resident -
                                  (long long) DEFAULT_HEADROOM;
         if (budget <= 0) {
             p.reason = "no RAM is left beside the model for a KV cache";
@@ -227,13 +271,15 @@ struct Options {
     int ctx = 0;
     int n_predict = 64;
     int threads = 0;            // 0 = physical cores
-    int ngl = 0;
+    int ngl = -1;               // -1 = fit the free VRAM, 0 = CPU only
     float temp = 0.0f;          // 0 = greedy
     float top_p = 0.95f;
     float min_p = 0.05f;
     uint32_t seed = LLAMA_DEFAULT_SEED;
     bool plan_only = false;
-    bool warmup = true;
+    // Off by default: a warmup decode costs 8% of every later token on CUDA
+    // (91.8 vs 99.3 t/s, same prompt). It exists for a clean prompt number.
+    bool warmup = false;
     bool help = false;
 };
 
@@ -242,16 +288,20 @@ void print_usage(const char * argv0) {
         "\nusage:\n"
         "  %s -m model.gguf [options]\n\n"
         "options:\n"
-        "  -c N            context to request (0 = the model's trained context)\n"
+        "  -c N            context to request (0 = fitted: the largest that fits;\n"
+        "                  with -ngl 0 it defaults to the model's trained context)\n"
         "  -n N            tokens to generate (default 64)\n"
         "  -t N            threads (default: physical cores)\n"
-        "  -ngl N          layers on GPU (default 0)\n"
+        "  -ngl N          layers on GPU; default fits the free VRAM (see --fit)\n"
+        "  --fit on|off    place layers across GPU and RAM automatically (default on)\n"
         "  -p TEXT         prompt (default \"The capital of France is\")\n"
         "  --kv TYPE       KV cache type for K and V (default f16)\n"
         "  -ctk/-ctv TYPE  set K and V separately\n"
         "  --temp/--top-p/--min-p/--seed   sampling (temp 0 = greedy, the default)\n"
         "  --plan          print the plan and exit (loads metadata only)\n"
-        "  --no-warmup     skip the one-token warmup pass\n"
+        "  --warmup        decode one token first so the prompt number excludes\n"
+        "                  graph allocation (costs 8% of decode)\n"
+        "  --no-warmup     accepted for compatibility; it is the default\n"
         "  --verbose       forward llama.cpp's INFO log to stderr\n"
         "  -h, --help\n\n", argv0);
 }
@@ -262,6 +312,7 @@ bool parse_args(int argc, char ** argv, Options & o) {
         const bool has_value = i + 1 < argc;
         if (a == "-h" || a == "--help") { o.help = true; return true; }
         else if (a == "--plan")     { o.plan_only = true; }
+        else if (a == "--warmup")   { o.warmup = true; }
         else if (a == "--no-warmup"){ o.warmup = false; }
         else if (a == "--verbose")  { g_verbose = true; }
         else if (a == "-m" && has_value) { o.model = argv[++i]; }
@@ -269,7 +320,20 @@ bool parse_args(int argc, char ** argv, Options & o) {
         else if (a == "-c" && has_value) { o.ctx = std::atoi(argv[++i]); }
         else if (a == "-n" && has_value) { o.n_predict = std::atoi(argv[++i]); }
         else if (a == "-t" && has_value) { o.threads = std::atoi(argv[++i]); }
-        else if (a == "-ngl" && has_value){ o.ngl = std::atoi(argv[++i]); }
+        else if (a == "-ngl" && has_value) {
+            const std::string v = argv[++i];
+            // 'auto' spells the default; atoi("auto") would mean CPU-only.
+            o.ngl = (v == "auto") ? -1 : std::atoi(v.c_str());
+        }
+        else if (a == "--fit" && has_value) {
+            const std::string v = argv[++i];
+            if (v != "on" && v != "off") {
+                std::fprintf(stderr, "error: --fit takes 'on' or 'off', not '%s'\n", v.c_str());
+                return false;
+            }
+            // An explicit -ngl keeps its value; off only rules out fitting.
+            o.ngl = (v == "on") ? -1 : (o.ngl > 0 ? o.ngl : 0);
+        }
         else if (a == "--kv" && has_value) { o.kv_k = o.kv_v = argv[++i]; }
         else if (a == "-ctk" && has_value) { o.kv_k = argv[++i]; }
         else if (a == "-ctv" && has_value) { o.kv_v = argv[++i]; }
@@ -366,7 +430,42 @@ int main(int argc, char ** argv) {
     llama_backend_init();
 
     llama_model_params model_params = llama_model_default_params();
-    model_params.n_gpu_layers = opt.ngl;
+    llama_context_params cparams = llama_context_default_params();
+    const Device device = first_gpu();
+    const bool auto_placement = opt.ngl < 0;
+    bool fit_failed = false;
+    uint32_t fitted_ctx = 0;
+
+    // These stay alive for the whole load: the fit writes their addresses into
+    // mparams, and llama.cpp dereferences them while the model is loaded.
+    std::vector<float> tensor_split(llama_max_devices(), 0.0f);
+    std::vector<llama_model_tensor_buft_override> overrides(llama_max_tensor_buft_overrides());
+    std::vector<size_t> margins(llama_max_devices(), 1024 * MIB);
+
+    if (auto_placement) {
+        // llama.cpp's own fitter, given the tensor map, decides what the card
+        // can hold: it costs one metadata-only load and it is the difference
+        // between "28/28" and a guess that OOMs on a card with a desktop on it.
+        cparams.n_ctx = opt.ctx > 0 ? (uint32_t) opt.ctx : 0;
+
+        const common_params_fit_status status = common_fit_params(
+            opt.model.c_str(), &model_params, &cparams, tensor_split.data(),
+            overrides.data(), margins.data(), 4096, nullptr,
+            g_verbose ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
+        if (status == COMMON_PARAMS_FIT_STATUS_SUCCESS) {
+            opt.ngl = model_params.n_gpu_layers;
+            fitted_ctx = cparams.n_ctx;
+        } else {
+            // No device, or a context that cannot be made to fit: keep every
+            // layer in RAM rather than fail the load.
+            model_params.n_gpu_layers = 0;
+            opt.ngl = 0;
+            fit_failed = true;
+        }
+    } else {
+        model_params.n_gpu_layers = opt.ngl;
+    }
+
     // --plan still loads the weights: llama.cpp only finalises some hparams (the
     // per-layer KV head list among them) while loading tensors, and reading them
     // from a vocab-only model aborts. Planning cheaply is not worth an abort.
@@ -381,7 +480,16 @@ int main(int argc, char ** argv) {
     const std::vector<int> heads = kv_heads_per_layer(model.get());
     const size_t model_bytes = (size_t) llama_model_size(model.get());
     const size_t available = mem_available_bytes();
-    const Plan plan = make_plan(model.get(), opt.ctx, type_k, type_v, heads, model_bytes, available);
+    const int n_layer = std::max(1, llama_model_n_layer(model.get()));
+    // -1 is llama.cpp's "all layers": the fit leaves it alone when the card
+    // holds the whole model, so it means "all", not "none".
+    const int gpu_layers = opt.ngl < 0 ? n_layer : std::min(opt.ngl, n_layer);
+    // Per-layer bytes are the model's average; the non-repeating tensors ride
+    // along in RAM either way, so this charges them to the CPU side.
+    const size_t resident = model_bytes * (size_t) (n_layer - gpu_layers) / (size_t) n_layer;
+    const int requested = opt.ctx > 0 ? opt.ctx : (int) fitted_ctx;
+    const Plan plan = make_plan(model.get(), requested, type_k, type_v, heads, resident, available,
+                                (int) fitted_ctx);
     const int threads = opt.threads > 0 ? opt.threads : physical_cores();
     const int train = llama_model_n_ctx_train(model.get());
 
@@ -390,12 +498,36 @@ int main(int argc, char ** argv) {
                 model_bytes / MIB, llama_model_n_layer(model.get()),
                 llama_model_n_head_kv(model.get()),
                 llama_model_n_embd(model.get()) / std::max(1, llama_model_n_head(model.get())));
+    // The placement comes first: it decides what the rest of the plan means.
+    if (device.present) {
+        std::printf("  gpu            %s, %zu MiB free / %zu MiB\n",
+                    device.name.c_str(), device.free / MIB, device.total / MIB);
+    } else {
+        std::printf("  gpu            none (CPU only)\n");
+    }
+    if (!auto_placement) {
+        std::printf("  gpu layers     %d/%d (given by -ngl)\n", gpu_layers, n_layer);
+    } else if (fit_failed) {
+        std::printf("  gpu layers     0/%d (nothing fit the card; every layer stays in RAM)\n",
+                    n_layer);
+    } else if (opt.ngl < 0) {
+        std::printf("  gpu layers     %d/%d (the whole model fits the card)\n", n_layer, n_layer);
+    } else {
+        std::printf("  gpu layers     %d/%d (fitted to the free VRAM, the rest in RAM)\n",
+                    gpu_layers, n_layer);
+    }
+    std::printf("  ram weights    ~%zu MiB of the model stays in system RAM\n", resident / MIB);
     std::printf("  kv cache       %zu MiB at %d tokens (%s/%s)\n",
                 plan.kv / MIB, plan.ctx, opt.kv_k.c_str(),
                 (opt.kv_v.empty() ? opt.kv_k : opt.kv_v).c_str());
+    if (gpu_layers > 0) {
+        // llama.cpp keeps the cache of an offloaded layer on that device.
+        std::printf("  kv on gpu      ~%zu MiB for %d of %d layers, the rest in RAM\n",
+                    plan.kv * (size_t) gpu_layers / (size_t) n_layer / MIB, gpu_layers, n_layer);
+    }
     std::printf("  available      %zu MiB\n", available / MIB);
     std::printf("  context        %d requested, %d used (train limit %d)\n",
-                opt.ctx > 0 ? opt.ctx : train, plan.ctx, train);
+                opt.ctx > 0 ? opt.ctx : (requested > 0 ? requested : train), plan.ctx, train);
     if (plan.clamped) {
         std::printf("  clamped        %s\n", plan.reason.c_str());
     }
@@ -419,7 +551,6 @@ int main(int argc, char ** argv) {
         return 0;
     }
 
-    llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx = (uint32_t) plan.ctx;
     cparams.n_batch = std::min<uint32_t>(2048u, (uint32_t) plan.ctx);
     cparams.n_ubatch = std::min<uint32_t>(512u, cparams.n_batch);
@@ -445,7 +576,9 @@ int main(int argc, char ** argv) {
         llama_backend_free();
         return 1;
     }
-    if (n_prompt >= plan.ctx) {
+    // The warmup token, when there is one, occupies the first position.
+    const int pos0 = opt.warmup ? 1 : 0;
+    if (n_prompt + pos0 > plan.ctx) {
         std::fprintf(stderr,
                      "error: prompt is %d tokens and the window holds %d; raise -c or shorten the prompt\n",
                      n_prompt, plan.ctx);
@@ -460,44 +593,44 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // One-token warmup in a throwaway context: the first llama_decode on a model
-    // allocates the compute graph, and charging that to prompt throughput is how
-    // a benchmark reports a number nobody can reproduce.
+    BatchPtr batch(llama_batch_ext_init(ctx.get()));
+
+    // Optional warmup: the first llama_decode allocates the compute graph, and
+    // charging that to prompt throughput is how a benchmark reports a number
+    // nobody can reproduce. It runs here, in this context, and the token stays
+    // in the cache so the prompt continues at pos 1: a throwaway context and a
+    // cache rollback were both measured slower by the same 8%.
     if (opt.warmup) {
-        llama_context_params wparams = cparams;
-        wparams.n_ctx = 8;
-        wparams.n_batch = 8;
-        wparams.n_ubatch = 8;
-        CtxPtr warm(llama_init_from_model(model.get(), wparams));
-        if (warm) {
-            BatchPtr wb(llama_batch_ext_init(warm.get()));
-            const llama_token bos = llama_vocab_bos(vocab);
-            batch_set(wb.get(), &bos, 1, 0, true);
-            llama_process(warm.get(), LLAMA_PROCESS_TYPE_DECODE, wb.get());
+        const llama_token bos = llama_vocab_bos(vocab);
+        batch_set(batch.get(), &bos, 1, 0, true);
+        if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
+            std::fprintf(stderr, "error: warmup decode failed\n");
+            llama_backend_free();
+            return 1;
         }
     }
-
-    BatchPtr batch(llama_batch_ext_init(ctx.get()));
 
     // Prefill in n_batch chunks: a prompt larger than the batch limit is legal,
     // but handing llama.cpp one oversized batch aborts the process.
     const int n_ctx = plan.ctx;
-    int pos = 0;
+    int pos = pos0;
+    int n_done = 0;
     const double t_prefill_start = now_s();
-    while (pos < n_prompt) {
-        const int n = std::min<int>((int) cparams.n_batch, n_prompt - pos);
-        batch_set(batch.get(), prompt_tokens.data() + pos, n, pos, true);
+    while (n_done < n_prompt) {
+        const int n = std::min<int>((int) cparams.n_batch, n_prompt - n_done);
+        batch_set(batch.get(), prompt_tokens.data() + n_done, n, pos, true);
         if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
             std::fprintf(stderr, "error: prompt evaluation failed at token %d\n", pos);
             llama_backend_free();
             return 1;
         }
         pos += n;
+        n_done += n;
     }
     const double t_prefill_end = now_s();
 
     SamplerPtr sampler = make_sampler(opt);
-    const int budget = std::min(opt.n_predict, n_ctx - n_prompt);
+    const int budget = std::min(opt.n_predict, n_ctx - pos);
     std::vector<double> token_ms;
     token_ms.reserve((size_t) std::max(0, budget));
     int n_generated = 0;
@@ -546,6 +679,12 @@ int main(int argc, char ** argv) {
     std::printf("\n\n");
     std::printf("  prompt         %7.1f t/s  (%d tokens, %.2f s)\n",
                 n_prompt / std::max(1e-9, prefill_s), n_prompt, prefill_s);
+    if (!opt.warmup) {
+        // Say it rather than let the number look wrong: this is the graph
+        // allocation, and moving it out costs more in decode than it buys here.
+        std::printf("  note           the first prefill carries the one-time graph allocation;\n"
+                    "                 --warmup times it out and costs 8%% of decode\n");
+    }
     if (n_generated > 0) {
         std::printf("  generation     %7.2f t/s  (%d tokens, %.2f s)\n",
                     n_generated / std::max(1e-9, gen_s), n_generated, gen_s);
