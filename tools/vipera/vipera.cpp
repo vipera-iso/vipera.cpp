@@ -15,6 +15,7 @@
 #include "fit.h"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -24,6 +25,9 @@
 #include <string>
 #include <thread>
 #include <vector>
+
+#include <sys/wait.h>
+#include <unistd.h>
 
 namespace {
 
@@ -275,14 +279,21 @@ struct Options {
     int ubatch = 0;             // 0 = min(512, -b); the CPU side sizes the batch
     int fit_target = 0;         // MiB kept free on the card; 0 = scale to its size
     int n_cpu_ffn = 0;          // 0 = off; else this many layers read FFN from RAM
+    // -ncffn auto: pick it by probing, see run_ffn_ladder.
+    bool ffn_auto = false;
+    // Internal, set on the probe children the ladder spawns: load, create the
+    // context, report, exit. Never a user-facing mode.
+    bool ffn_probe = false;
     float temp = 0.0f;          // 0 = greedy
     float top_p = 0.95f;
     float min_p = 0.05f;
     uint32_t seed = LLAMA_DEFAULT_SEED;
     bool plan_only = false;
     int kv_mode = 0;            // 0 = KV cache on the card, -1 = in RAM (-nkvo)
-    // Off by default: a warmup decode costs 8% of every later token on CUDA
-    // (91.8 vs 99.3 t/s, same prompt). It exists for a clean prompt number.
+    // Off by default: the prompt number below excludes the allocation because
+    // the prefill is synchronised, so the warmup only costs its own token
+    // (measured 387.8 vs 396.4 t/s prompt, 73.8 vs 73.4 decode, 1281-token
+    // prompt on CUDA). It stays for callers that want a warm cache.
     bool warmup = false;
     bool help = false;
 };
@@ -302,24 +313,29 @@ void print_usage(const char * argv0) {
         "  -ngl N          layers on GPU; default fits the free VRAM (see --fit)\n"
         "  --fit on|off    place layers across GPU and RAM automatically (default on)\n"
         "  --fit-target N  MiB the fit must leave free on the card (default: a\n"
-        "                  scaled one - card/8, at least 256, at most 512, where\n"
-        "                  upstream's fixed 1024 is 28%% of a 4 GB card)\n"
+        "                  scaled one - card/16, at least 192, at most 512, where\n"
+        "                  upstream's fixed 1024 is 28%% of a 4 GB card and\n"
+        "                  card/8 was worth three layers)\n"
         "  -nkvo           keep the KV cache in RAM instead of on the card; on a\n"
         "                  partial split it buys layers (19/28 vs 17/28 at 8k on\n"
         "                  a 4 GB card) and costs a bus read per attention step\n"
         "  -ncffn N        attention of every layer on the card, FFN of the first\n"
-        "                  N layers read from RAM. Measured on a 4 GB card, 7B at\n"
-        "                  8k: 8 layers decoded 16.8 t/s against 11.4 for 17 whole\n"
-        "                  layers (+48%%). Bypasses the fit - the split cannot be\n"
-        "                  priced from a header - so pass -c; -ctk stays f16 only\n"
-        "                  when it fits, otherwise it is lowered to q8_0\n"
+        "                  N layers read from RAM. Bypasses the fit - the split\n"
+        "                  cannot be priced from a header - so pass -c; -ctk stays\n"
+        "                  f16 only when it fits, otherwise it is lowered to q8_0\n"
+        "  -ncffn auto     find the smallest N that still creates a context and\n"
+        "                  run that: smaller is faster, so the answer sits on the\n"
+        "                  cliff (measured 7B/4 GB: 5 fails, 6 runs). Costs a\n"
+        "                  probe process per rung - ~1.5 s per rung that fails,\n"
+        "                  plus the one that wins - each a child process, so no\n"
+        "                  VRAM leaks between attempts\n"
         "  -p TEXT         prompt (default \"The capital of France is\")\n"
         "  --kv TYPE       KV cache type for K and V (default f16)\n"
         "  -ctk/-ctv TYPE  set K and V separately\n"
         "  --temp/--top-p/--min-p/--seed   sampling (temp 0 = greedy, the default)\n"
         "  --plan          print the plan and exit (loads metadata only)\n"
-        "  --warmup        decode one token first so the prompt number excludes\n"
-        "                  graph allocation (costs 8%% of decode)\n"
+        "  --warmup        decode one token first so the prompt starts from a\n"
+        "                  warm graph (costs that one token, ~2%% of prompt)\n"
         "  --no-warmup     accepted for compatibility; it is the default\n"
         "  --verbose       forward llama.cpp's INFO log to stderr\n"
         "  -h, --help\n\n", argv0);
@@ -342,7 +358,14 @@ bool parse_args(int argc, char ** argv, Options & o) {
         else if (a == "-t" && has_value) { o.threads = std::atoi(argv[++i]); }
         else if (a == "-ub" && has_value) { o.ubatch = std::atoi(argv[++i]); }
         else if (a == "--fit-target" && has_value) { o.fit_target = std::atoi(argv[++i]); }
-        else if ((a == "-ncffn" || a == "--n-cpu-ffn") && has_value) { o.n_cpu_ffn = std::atoi(argv[++i]); }
+        else if ((a == "-ncffn" || a == "--n-cpu-ffn") && has_value) {
+            const std::string v = argv[++i];
+            // Same trap as -ngl auto: atoi("auto") means 0, which is the
+            // classic split and would look applied while holding nothing back.
+            if (v == "auto") { o.ffn_auto = true; o.n_cpu_ffn = 0; }
+            else { o.n_cpu_ffn = std::atoi(v.c_str()); }
+        }
+        else if (a == "--ncffn-probe") { o.ffn_probe = true; }
         else if (a == "-ngl" && has_value) {
             const std::string v = argv[++i];
             // 'auto' spells the default; atoi("auto") would mean CPU-only.
@@ -441,6 +464,106 @@ double percentile(std::vector<double> v, double q) {
     return v[idx];
 }
 
+// -------------------------------------------------------- ffn ladder -------
+// Exit code a probe child uses for "the context did not fit". Distinct from 1
+// so the ladder can tell an out-of-VRAM rung from a bad model path and stop
+// climbing in the second case instead of spawning 60 more processes.
+constexpr int PROBE_NO_CONTEXT = 2;
+// No model on any card has needed a larger FFN-on-CPU count than this to make a
+// context; the ladder stops here rather than spin if the answer is "never".
+constexpr int FFN_LADDER_MAX = 64;
+
+int spawn_self(const std::vector<std::string> & args) {
+    std::vector<char *> argv;
+    argv.reserve(args.size() + 1);
+    for (const auto & a : args) {
+        argv.push_back(const_cast<char *>(a.c_str()));
+    }
+    argv.push_back(nullptr);
+
+    const pid_t pid = fork();
+    if (pid < 0) {
+        std::fprintf(stderr, "error: fork failed: %s\n", std::strerror(errno));
+        return 127;
+    }
+    if (pid == 0) {
+        // /proc/self/exe, not argv[0]: the ladder has to re-run this binary even
+        // when it was started through a PATH lookup or a symlink.
+        execv("/proc/self/exe", argv.data());
+        std::fprintf(stderr, "error: cannot re-run this binary: %s\n", std::strerror(errno));
+        _exit(127);
+    }
+
+    int status = 0;
+    if (waitpid(pid, &status, 0) < 0) {
+        std::fprintf(stderr, "error: waitpid failed: %s\n", std::strerror(errno));
+        return 127;
+    }
+    if (WIFEXITED(status)) {
+        return WEXITSTATUS(status);
+    }
+    if (WIFSIGNALED(status)) {
+        return 128 + WTERMSIG(status);
+    }
+    return 127;
+}
+
+// `-ncffn auto`: the smallest FFN-on-CPU count that still creates a context.
+//
+// In-process probing was rejected. A context that fails to allocate does not
+// hand its VRAM back, so a few failures in a row turn a split that would load
+// into one that does not - the same wall vipera's Python ladder documents after
+// three failures on a 4 GB card. A child process returns every byte to the
+// driver when it exits, so each rung starts from the same card.
+//
+// Most aggressive first, because a smaller count is the faster run: every FFN
+// block on the card is a block not read over the bus on every token. The
+// winning rung then runs for real in its own child, so the numbers reported are
+// a clean process and the ladder never pays for two generations.
+int run_ffn_ladder(int argc, char ** argv, const std::string & model) {
+    // One message for a bad path beats sixty child processes each reporting it.
+    FILE * f = std::fopen(model.c_str(), "rb");
+    if (!f) {
+        std::fprintf(stderr, "error: cannot open %s: %s\n", model.c_str(), std::strerror(errno));
+        return 1;
+    }
+    std::fclose(f);
+
+    int value_idx = -1;
+    for (int i = 1; i < argc; ++i) {
+        const std::string a = argv[i];
+        if ((a == "-ncffn" || a == "--n-cpu-ffn") && i + 1 < argc) {
+            value_idx = i + 1;
+            ++i;
+        }
+    }
+    if (value_idx < 0) {
+        std::fprintf(stderr, "error: -ncffn auto needs the flag it belongs to\n");
+        return 1;
+    }
+
+    std::vector<std::string> args(argv, argv + argc);
+    for (int n = 1; n <= FFN_LADDER_MAX; ++n) {
+        args[(size_t) value_idx] = std::to_string(n);
+        std::vector<std::string> probe = args;
+        probe.push_back("--ncffn-probe");
+        const int code = spawn_self(probe);
+        if (code == 0) {
+            std::fprintf(stderr, "vipera: -ncffn auto chose %d: the smallest count that\n"
+                                 "        creates a context at this -c\n", n);
+            return spawn_self(args);
+        }
+        if (code != PROBE_NO_CONTEXT) {
+            std::fprintf(stderr,
+                         "error: the probe at -ncffn %d exited %d, which is not an\n"
+                         "       out-of-VRAM failure; not climbing further\n", n, code);
+            return code;
+        }
+    }
+    std::fprintf(stderr, "error: no -ncffn up to %d created a context\n", FFN_LADDER_MAX);
+    return 1;
+}
+
 }  // namespace
 
 int main(int argc, char ** argv) {
@@ -452,6 +575,18 @@ int main(int argc, char ** argv) {
     if (opt.help) {
         print_usage(argv[0]);
         return 0;
+    }
+
+    // A probe answers one question - does a context fit at this count - so the
+    // plan-only exit must not answer it before the context is created.
+    if (opt.ffn_probe) {
+        opt.plan_only = false;
+    }
+
+    // `-ncffn auto` is resolved before any model work: the ladder re-runs this
+    // binary per rung, so the parent never loads a weight itself.
+    if (opt.ffn_auto) {
+        return run_ffn_ladder(argc, argv, opt.model);
     }
 
     const bool ffn_split = opt.n_cpu_ffn > 0;
@@ -499,9 +634,22 @@ int main(int argc, char ** argv) {
     }
     // A fixed 1 GiB margin is 28% of a 4 GB card and 4 more layers left on the
     // CPU. Scale it to the card, with a floor for the driver's own allocations.
+    // The fit already prices the weights and the compute buffers, so this is
+    // only room for the driver and for whatever else grows later; the card's
+    // own free figure above is already net of the desktop.
+    // card/8 (466 MiB here) turned out to cost three layers. Measured on a
+    // GTX 1650 4 GB, Qwen2.5-7B Q4_K_M, f16 KV, both a 641- and a 1281-token
+    // prompt, ctx 3072/4096/8192: 466 MiB keeps 18/28 layers (14.47 t/s),
+    // 256 keeps 19, 224 keeps 20 (15.46 t/s), 64 keeps 21 (16.33 t/s) - and 22
+    // never loads at any margin, so the fit's own buffers are the wall, not the
+    // driver. card/16 is 233 MiB here, which lands on the 20-layer rung and
+    // across the largest margin this card was measured to still fit. The KV
+    // cache is allocated for the whole window up front and the compute buffers
+    // are fixed, so a split that loads is a split that lasts: nothing grows
+    // during the run except by another process taking the card.
     const size_t margin = opt.fit_target > 0
                               ? (size_t) opt.fit_target * MIB
-                              : std::min(DEFAULT_HEADROOM, std::max(256 * MIB, device.total / 8));
+                              : std::min(DEFAULT_HEADROOM, std::max(192 * MIB, device.total / 16));
     std::vector<size_t> margins(llama_max_devices(), margin);
 
     if (ffn_split && !device.present) {
@@ -589,6 +737,13 @@ int main(int argc, char ** argv) {
 
     ModelPtr model(llama_model_load_from_file(opt.model.c_str(), model_params));
     if (!model) {
+        if (opt.ffn_probe) {
+            // Too many FFN blocks on the card fails here rather than at the
+            // context: llama.cpp cannot allocate the tensor buffers at load.
+            std::fprintf(stderr, "probe: -ncffn %d does not load\n", opt.n_cpu_ffn);
+            llama_backend_free();
+            return PROBE_NO_CONTEXT;
+        }
         std::fprintf(stderr, "error: cannot load %s\n", opt.model.c_str());
         llama_backend_free();
         return 1;
@@ -736,7 +891,17 @@ int main(int argc, char ** argv) {
         }
         std::fprintf(stderr, "\n");
         llama_backend_free();
-        return 1;
+        // A probe rung reports "did not fit" in a way the ladder can read; every
+        // other failure stays a plain 1 so the ladder stops instead of climbing.
+        return opt.ffn_probe ? PROBE_NO_CONTEXT : 1;
+    }
+
+    // The ladder only needs to know that a context exists at this count; the
+    // prompt and the generation are the parent's job, in a clean process.
+    if (opt.ffn_probe) {
+        std::fprintf(stderr, "probe: -ncffn %d creates a %d-token context\n", opt.n_cpu_ffn, plan.ctx);
+        llama_backend_free();
+        return 0;
     }
 
     const llama_vocab * vocab = llama_model_get_vocab(model.get());
@@ -798,6 +963,9 @@ int main(int argc, char ** argv) {
         pos += n;
         n_done += n;
     }
+    // decode() only enqueues the graph; without this the last chunk's compute
+    // and the one-time allocation would be charged to the first generated token.
+    llama_synchronize(ctx.get());
     const double t_prefill_end = now_s();
 
     SamplerPtr sampler = make_sampler(opt);
@@ -825,6 +993,13 @@ int main(int argc, char ** argv) {
             llama_backend_free();
             return 1;
         }
+        // Same reason as above: llama.cpp's decode is asynchronous, so the
+        // wait lands in whichever call next reads the output. Measured without
+        // this, a 13 ms token reported a 0.3 ms median (75 t/s decode alongside
+        // "median 0.31 ms"); the synchronize moves the wait into the window
+        // that claims to measure it and costs nothing - the sampler below would
+        // have blocked for exactly as long.
+        llama_synchronize(ctx.get());
         token_ms.push_back((now_s() - t0) * 1000.0);
 
         ++pos;
@@ -852,9 +1027,9 @@ int main(int argc, char ** argv) {
                 n_prompt / std::max(1e-9, prefill_s), n_prompt, prefill_s);
     if (!opt.warmup) {
         // Say it rather than let the number look wrong: this is the graph
-        // allocation, and moving it out costs more in decode than it buys here.
+        // allocation, and it lands here because the prefill is synchronised.
         std::printf("  note           the first prefill carries the one-time graph allocation;\n"
-                    "                 --warmup times it out and costs 8%% of decode\n");
+                    "                 --warmup moves it into a one-token decode\n");
     }
     if (n_generated > 0) {
         std::printf("  generation     %7.2f t/s  (%d tokens, %.2f s)\n",
