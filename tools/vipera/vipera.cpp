@@ -26,6 +26,7 @@
 #include <thread>
 #include <vector>
 
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -428,11 +429,13 @@ SamplerPtr make_sampler(const Options & o) {
     return chain;
 }
 
-double median(std::vector<double> v) {
+// Sorted input: the caller sorts the sample once, rather than each helper
+// copying and re-sorting the same vector - three copies and three sorts for
+// one printed line, with identical numbers.
+double median_sorted(const std::vector<double> & v) {
     if (v.empty()) {
         return 0.0;
     }
-    std::sort(v.begin(), v.end());
     const size_t n = v.size();
     return n % 2 ? v[n / 2] : 0.5 * (v[n / 2 - 1] + v[n / 2]);
 }
@@ -455,11 +458,10 @@ bool add_ffn_cpu_override(std::vector<std::string> & keep,
     return true;
 }
 
-double percentile(std::vector<double> v, double q) {
+double percentile_sorted(const std::vector<double> & v, double q) {
     if (v.empty()) {
         return 0.0;
     }
-    std::sort(v.begin(), v.end());
     const size_t idx = (size_t) std::min<double>((double) v.size() - 1, std::floor(q * (double) v.size()));
     return v[idx];
 }
@@ -508,6 +510,87 @@ int spawn_self(const std::vector<std::string> & args) {
     return 127;
 }
 
+// ------------------------------------------------------ ladder memory ------
+// Every rung of the climb is a child process that loads the whole model, so a
+// failed rung costs ~1.5 s - and the ladder pays that again on the next run,
+// for an answer that cannot have changed. The answer for a given (model,
+// context, KV type) is kept in $XDG_CACHE_HOME/vipera/ffn-ladder.txt as
+// "key<TAB>value" lines. Appending is enough because the last match wins: a
+// crash mid-write cannot damage an answer that is already there.
+std::string ladder_path() {
+    const char * cache = std::getenv("XDG_CACHE_HOME");
+    std::string base;
+    if (cache != nullptr && *cache != '\0') {
+        base = cache;
+    } else {
+        const char * home = std::getenv("HOME");
+        if (home == nullptr || *home == '\0') {
+            return {};
+        }
+        base = std::string(home) + "/.cache";
+    }
+    return base + "/vipera/ffn-ladder.txt";
+}
+
+// The context and the KV type decide what fits, so both are part of the key: a
+// rung measured at 4096 is not the answer at 8192.
+std::string ladder_key(const std::string & model, int ctx, const std::string & kv_k,
+                       const std::string & kv_v) {
+    struct stat st {};
+    long long size = 0;
+    long long mtime = 0;
+    if (::stat(model.c_str(), &st) == 0) {
+        size = (long long) st.st_size;
+        mtime = (long long) st.st_mtime;
+    }
+    char buf[1024];
+    std::snprintf(buf, sizeof(buf), "%s|%lld|%lld|%d|%s/%s", model.c_str(), size, mtime, ctx,
+                  kv_k.c_str(), kv_v.c_str());
+    return buf;
+}
+
+int ladder_lookup(const std::string & key) {
+    const std::string path = ladder_path();
+    if (path.empty()) {
+        return 0;
+    }
+    FILE * f = std::fopen(path.c_str(), "r");
+    if (f == nullptr) {
+        return 0;
+    }
+    char line[1024];
+    int found = 0;
+    while (std::fgets(line, sizeof(line), f) != nullptr) {
+        const std::string row(line);
+        const size_t tab = row.find('\t');
+        if (tab == std::string::npos) {
+            continue;
+        }
+        if (row.compare(0, tab, key) == 0) {
+            found = std::atoi(row.c_str() + tab + 1);
+        }
+    }
+    std::fclose(f);
+    return found;
+}
+
+void ladder_remember(const std::string & key, int n) {
+    const std::string path = ladder_path();
+    if (path.empty()) {
+        return;
+    }
+    const size_t slash = path.rfind('/');
+    if (slash != std::string::npos) {
+        ::mkdir(path.substr(0, slash).c_str(), 0755);
+    }
+    FILE * f = std::fopen(path.c_str(), "a");
+    if (f == nullptr) {
+        return;
+    }
+    std::fprintf(f, "%s\t%d\n", key.c_str(), n);
+    std::fclose(f);
+}
+
 // `-ncffn auto`: the smallest FFN-on-CPU count that still creates a context.
 //
 // In-process probing was rejected. A context that fails to allocate does not
@@ -542,13 +625,55 @@ int run_ffn_ladder(int argc, char ** argv, const std::string & model) {
         return 1;
     }
 
+    int want_ctx = 0;
+    std::string want_kv_k = "f16";
+    std::string want_kv_v;
+    for (int i = 1; i + 1 < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "-c") { want_ctx = std::atoi(argv[i + 1]); }
+        else if (a == "--kv") { want_kv_k = want_kv_v = argv[i + 1]; }
+        else if (a == "-ctk") { want_kv_k = argv[i + 1]; }
+        else if (a == "-ctv") { want_kv_v = argv[i + 1]; }
+    }
+    const std::string key = ladder_key(model, want_ctx, want_kv_k,
+                                       want_kv_v.empty() ? want_kv_k : want_kv_v);
+
     std::vector<std::string> args(argv, argv + argc);
-    for (int n = 1; n <= FFN_LADDER_MAX; ++n) {
+    int first_rung = 1;
+    // A remembered rung is confirmed, not trusted: the entry may predate another
+    // process taking VRAM. A rung that no longer creates a context falls through
+    // to the climb below, which is also the direction a stale rung needs - a
+    // card that shrank needs MORE FFN on the CPU, not less.
+    const int remembered = ladder_lookup(key);
+    if (remembered > 0) {
+        args[(size_t) value_idx] = std::to_string(remembered);
+        std::vector<std::string> probe = args;
+        probe.push_back("--ncffn-probe");
+        const int code = spawn_self(probe);
+        if (code == 0) {
+            std::fprintf(stderr,
+                         "vipera: -ncffn auto reuses %d from the ladder memory\n"
+                         "        (confirmed at this -c; delete %s to re-measure)\n",
+                         remembered, ladder_path().c_str());
+            return spawn_self(args);
+        }
+        if (code != PROBE_NO_CONTEXT) {
+            std::fprintf(stderr,
+                         "error: the probe at -ncffn %d exited %d, which is not an\n"
+                         "       out-of-VRAM failure; not climbing further\n",
+                         remembered, code);
+            return code;
+        }
+        first_rung = remembered + 1;
+    }
+
+    for (int n = first_rung; n <= FFN_LADDER_MAX; ++n) {
         args[(size_t) value_idx] = std::to_string(n);
         std::vector<std::string> probe = args;
         probe.push_back("--ncffn-probe");
         const int code = spawn_self(probe);
         if (code == 0) {
+            ladder_remember(key, n);
             std::fprintf(stderr, "vipera: -ncffn auto chose %d: the smallest count that\n"
                                  "        creates a context at this -c\n", n);
             return spawn_self(args);
@@ -973,7 +1098,6 @@ int main(int argc, char ** argv) {
     std::vector<double> token_ms;
     token_ms.reserve((size_t) std::max(0, budget));
     int n_generated = 0;
-    std::string line;
     const double t_gen_start = now_s();
     while (n_generated < budget) {
         const llama_token id = llama_sampler_sample(sampler.get(), ctx.get(), -1);
@@ -983,7 +1107,11 @@ int main(int argc, char ** argv) {
         char buf[256];
         const int n = llama_token_to_piece(vocab, id, buf, sizeof(buf), 0, true);
         if (n > 0) {
-            line.append(buf, (size_t) n);
+            // Written and flushed per token. Buffering until a token happened
+            // to contain a newline left text without one invisible until the
+            // generation finished.
+            std::fwrite(buf, 1, (size_t) n, stdout);
+            std::fflush(stdout);
         }
 
         const double t0 = now_s();
@@ -1004,21 +1132,14 @@ int main(int argc, char ** argv) {
 
         ++pos;
         ++n_generated;
-        if (n > 0 && buf[n - 1] == '\n') {
-            std::fwrite(line.data(), 1, line.size(), stdout);
-            std::fflush(stdout);
-            line.clear();
-        }
     }
     const double t_gen_end = now_s();
-    if (!line.empty()) {
-        std::fwrite(line.data(), 1, line.size(), stdout);
-    }
 
     // First generated token's cost includes the sample of the prefill's logits,
     // so it is excluded from the per-token statistics and reported separately.
     std::vector<double> steady(token_ms.size() > 1 ? std::vector<double>(token_ms.begin() + 1, token_ms.end())
                                                    : std::vector<double>());
+    std::sort(steady.begin(), steady.end());
     const double prefill_s = t_prefill_end - t_prefill_start;
     const double gen_s = t_gen_end - t_gen_start;
 
@@ -1036,7 +1157,7 @@ int main(int argc, char ** argv) {
                     n_generated / std::max(1e-9, gen_s), n_generated, gen_s);
         if (!steady.empty()) {
             std::printf("  per token      median %.2f ms, p90 %.2f ms, first %.2f ms\n",
-                        median(steady), percentile(steady, 0.9), token_ms.front());
+                        median_sorted(steady), percentile_sorted(steady, 0.9), token_ms.front());
         }
     }
     std::printf("  kv used        %zu MiB of the %zu MiB planned\n",
