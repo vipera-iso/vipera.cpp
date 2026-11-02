@@ -1,26 +1,15 @@
 name: CI (cann)
 
+# Manual only while the build below is disabled. Every job in this file is
+# commented out, so the workflow has nothing to run: GitHub cannot load it and
+# records a failed run with zero jobs on every push - a red check that says
+# nothing about the commit (it even reports the file path as the run's name
+# instead of `CI (cann)`). The old push filter also named `master` while this
+# fork's branch is `main`, so it never matched a real push anyway. Restore both
+# the triggers and the job from upstream (ggml-org/llama.cpp#23705) when
+# dedicated CANN runners exist.
 on:
   workflow_dispatch: # allows manual triggering
-  push:
-    branches:
-      - master
-    paths: [
-      '.github/workflows/build-cann.yml',
-      '**/CMakeLists.txt',
-      '**/.cmake',
-      '**/*.h',
-      '**/*.hpp',
-      '**/*.c',
-      '**/*.cpp'
-    ]
-
-  pull_request:
-    types: [opened, synchronize, reopened]
-    paths: [
-      '.github/workflows/build-cann.yml',
-      'ggml/src/ggml-cann/**'
-    ]
 
 cache-mode: none
 permissions:
