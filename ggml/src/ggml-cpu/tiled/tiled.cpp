@@ -727,8 +727,19 @@ static void tiled_store_window(const float * buf, int n_src0, int n_src1, int bu
 // thread-local scratch (contiguous rows, plus the [k/4][row][4] interleave on VNNI) so the
 // unpack and microtile are reused unchanged from mul_mat.
 
-// src0 rows per g group; finer than the TILED_TILE_K kernel tile so all threads stay busy at small ne01
-#define TILED_MMID_GROUP 64
+// src0 rows per g group. One window per thread at the least: a taller window repacks the
+// activation tile fewer times, a shorter one keeps more threads fed when ne01 is small
+static int64_t tiled_mmid_group(int64_t n_rows, int nth) {
+    int64_t group = (n_rows + nth - 1) / nth;
+    group = (group + TILED_MICRO - 1) / TILED_MICRO * TILED_MICRO;
+    if (group < TILED_MICRO) {
+        group = TILED_MICRO;
+    }
+    if (group > TILED_TILE_ROWS) {
+        group = TILED_TILE_ROWS;
+    }
+    return group;
+}
 
 // like tiled_store_window, but the dst columns are not contiguous: col_ptrs[j] points at the
 // start of dst column j, whose rows are contiguous (dim 0, nb0 == 4 bytes).
@@ -771,19 +782,19 @@ static void tiled_store_window_scatter(const float * buf, int n_src0, int n_src1
 template <typename B, int SUBBLK, bool HAS_MIN, int BIAS, bool ACTBIAS>
 static void tiled_mmid_gemm_window(struct ggml_tensor * dst, const struct ggml_tensor * src0,
                                    const char * src0_cur, int64_t r, int64_t k, int64_t nrows,
-                                   const int32_t * expert_rows,
+                                   int64_t group, const int32_t * expert_rows,
                                    const block_q8_K * const * rows,
                                    tiled_ws * ws) {
     const int64_t ne00 = src0->ne[0];
     const int64_t ne01 = src0->ne[1];
 
-    const int64_t r_end = MIN(r + TILED_MMID_GROUP, ne01);
+    const int64_t r_end = MIN(r + group, ne01);
     const int n_src0 = (int) (r_end - r);
 
     const size_t src0_bs = ggml_type_size(src0->type);
     const int64_t src0_stride = src0->nb[1] / src0_bs;
 
-    // the window is at most TILED_MMID_GROUP x TILED_TILE_K, so zero only that region of acc
+    // the window is at most group x TILED_TILE_K, so zero only that region of acc
     for (int64_t i = 0; i < n_src0; i++) {
         memset(&ws->acc[i * TILED_TILE_ROWS], 0, nrows * sizeof(float));
     }
@@ -873,8 +884,9 @@ static void ggml_compute_forward_mul_mat_id_tiled_one_expert(
     // this thread's workspace
     tiled_ws * ws = (tiled_ws *) (scratch + (size_t) ith * ggml_tiled_ws_size());
 
-    // groups of TILED_MMID_GROUP rows; rounded up, the window tail is clamped in the gemm
-    const int64_t ngroups = (ne01 + TILED_MMID_GROUP - 1) / TILED_MMID_GROUP;
+    // groups of `group` rows; rounded up, the window tail is clamped in the gemm
+    const int64_t group   = tiled_mmid_group(ne01, nth);
+    const int64_t ngroups = (ne01 + group - 1) / group;
 
     const int64_t g0 = (ngroups * ith) / nth;
     const int64_t g1 = (ngroups * (ith + 1)) / nth;
@@ -897,9 +909,9 @@ static void ggml_compute_forward_mul_mat_id_tiled_one_expert(
         }
 
         for (int64_t g = g0; g < g1; g++) {
-            const int64_t r = g * TILED_MMID_GROUP;
+            const int64_t r = g * group;
 
-            tiled_mmid_gemm_window<B, SUBBLK, HAS_MIN, BIAS, ACTBIAS>(dst, src0, src0_cur, r, k, nrows, expert_rows, rows, ws);
+            tiled_mmid_gemm_window<B, SUBBLK, HAS_MIN, BIAS, ACTBIAS>(dst, src0, src0_cur, r, k, nrows, group, expert_rows, rows, ws);
         }
     }
 }

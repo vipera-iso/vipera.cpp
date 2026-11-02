@@ -11,7 +11,6 @@
 
 #include "arch-fallback.h"
 
-#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <cassert>
@@ -4928,10 +4927,8 @@ template <typename BLOC_TYPE, int64_t INTER_SIZE, int64_t NB_COLS, ggml_type PAR
 // on - otherwise the weights end up repacked and every K-quant matmul silently takes the repack
 // kernel instead (ggml_tiled_supported rejects repacked tensors). Auto (-1) follows tiled;
 // --repack forces 1 to get the old behaviour back for A/B runs.
-static std::atomic<int> g_repack_kquants{-1};
-
 static bool ggml_repack_kquant_allowed(void) {
-    const int mode = g_repack_kquants.load(std::memory_order_relaxed);
+    const int mode = ggml_backend_repack_kquants_get();
     return mode < 0 ? !ggml_tiled_mm_enabled() : mode != 0;
 }
 
@@ -4946,10 +4943,6 @@ static bool ggml_is_kquant(enum ggml_type type) {
         default:
             return false;
     }
-}
-
-void ggml_cpu_set_repack_kquants(int mode) {
-    g_repack_kquants.store(mode, std::memory_order_relaxed);
 }
 
 static const ggml::cpu::tensor_traits * ggml_repack_get_optimal_repack_type(const struct ggml_tensor * cur) {
