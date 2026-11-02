@@ -10,9 +10,11 @@
 // measured by this process. Nothing is inferred.
 
 #include "llama.h"
+#include "accept.h"
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "fit.h"
+#include "speculative.h"
 
 #include <algorithm>
 #include <cerrno>
@@ -21,6 +23,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <memory>
 #include <string>
 #include <thread>
@@ -289,6 +292,12 @@ struct Options {
     float top_p = 0.95f;
     float min_p = 0.05f;
     uint32_t seed = LLAMA_DEFAULT_SEED;
+    // Self-speculation, off by default: the n-gram drafter proposes the tokens
+    // that followed the same n-gram in the prompt, and the model verifies them
+    // in one batch. Placement-neutral (no weights, no KV change), so it belongs
+    // beside -ngl rather than in the trade-offs -ncffn makes.
+    std::string spec = "off";
+    int spec_n = 48;            // draft tokens proposed per step
     bool plan_only = false;
     int kv_mode = 0;            // 0 = KV cache on the card, -1 = in RAM (-nkvo)
     // Off by default: the prompt number below excludes the allocation because
@@ -334,6 +343,15 @@ void print_usage(const char * argv0) {
         "  --kv TYPE       KV cache type for K and V (default f16)\n"
         "  -ctk/-ctv TYPE  set K and V separately\n"
         "  --temp/--top-p/--min-p/--seed   sampling (temp 0 = greedy, the default)\n"
+        "  --spec TYPE     self-speculative decoding with no extra model: the\n"
+        "                  n-gram map drafter indexes the prompt and proposes the\n"
+        "                  tokens that followed the same n-gram before, so the\n"
+        "                  model checks several tokens in one pass. No weights, no\n"
+        "                  KV change, no layer given up; it pays on output that\n"
+        "                  repeats the prompt and ~nothing on fresh prose. Types:\n"
+        "                  ngram-map-k (default pick), ngram-map-k4v,\n"
+        "                  ngram-simple, ngram-mod; 'off' is the default\n"
+        "  --spec-n N      draft tokens per step (default 48)\n"
         "  --plan          print the plan and exit (loads metadata only)\n"
         "  --warmup        decode one token first so the prompt starts from a\n"
         "                  warm graph (costs that one token, ~2%% of prompt)\n"
@@ -388,6 +406,8 @@ bool parse_args(int argc, char ** argv, Options & o) {
         else if (a == "--top-p" && has_value) { o.top_p = (float) std::atof(argv[++i]); }
         else if (a == "--min-p" && has_value) { o.min_p = (float) std::atof(argv[++i]); }
         else if (a == "--seed" && has_value) { o.seed = (uint32_t) std::strtoul(argv[++i], nullptr, 10); }
+        else if (a == "--spec" && has_value) { o.spec = argv[++i]; }
+        else if (a == "--spec-n" && has_value) { o.spec_n = std::atoi(argv[++i]); }
         else {
             std::fprintf(stderr, "error: unknown or incomplete argument '%s'\n", a.c_str());
             return false;
@@ -411,6 +431,17 @@ void batch_set(llama_batch_ext * batch, const llama_token * tokens, int n, llama
     }
     if (logits_last && n > 0) {
         llama_batch_ext_set_output_logits(batch, n - 1, true);
+    }
+}
+
+// One generated token on stdout, flushed. A token that does not happen to
+// contain a newline would otherwise stay invisible until the buffer filled.
+void emit_token(const llama_vocab * vocab, llama_token id) {
+    char buf[256];
+    const int n = llama_token_to_piece(vocab, id, buf, sizeof(buf), 0, true);
+    if (n > 0) {
+        std::fwrite(buf, 1, (size_t) n, stdout);
+        std::fflush(stdout);
     }
 }
 
@@ -462,7 +493,11 @@ double percentile_sorted(const std::vector<double> & v, double q) {
     if (v.empty()) {
         return 0.0;
     }
-    const size_t idx = (size_t) std::min<double>((double) v.size() - 1, std::floor(q * (double) v.size()));
+    // Nearest rank: index ceil(q*N) - 1, not floor(q*N). On 100 samples the
+    // latter reports the 91st value as "p90"; this tool's whole point is that
+    // the label matches the number.
+    const double scaled = std::ceil(q * (double) v.size()) - 1.0;
+    const size_t idx = (size_t) std::min<double>((double) v.size() - 1, std::max(0.0, scaled));
     return v[idx];
 }
 
@@ -535,7 +570,7 @@ std::string ladder_path() {
 // The context and the KV type decide what fits, so both are part of the key: a
 // rung measured at 4096 is not the answer at 8192.
 std::string ladder_key(const std::string & model, int ctx, const std::string & kv_k,
-                       const std::string & kv_v) {
+                       const std::string & kv_v, const Device & gpu) {
     struct stat st {};
     long long size = 0;
     long long mtime = 0;
@@ -543,9 +578,14 @@ std::string ladder_key(const std::string & model, int ctx, const std::string & k
         size = (long long) st.st_size;
         mtime = (long long) st.st_mtime;
     }
-    char buf[1024];
-    std::snprintf(buf, sizeof(buf), "%s|%lld|%lld|%d|%s/%s", model.c_str(), size, mtime, ctx,
-                  kv_k.c_str(), kv_v.c_str());
+    // The card is part of the key. The same file on a bigger GPU keeps more FFN
+    // blocks on it, and a rung remembered on the old card would be replayed
+    // forever: the extra FFN on the CPU still *loads*, so the confirmation step
+    // cannot catch it - the run just decodes slower for the rest of its life.
+    char buf[1536];
+    std::snprintf(buf, sizeof(buf), "%s|%lld|%lld|%d|%s/%s|%s|%zuMiB", model.c_str(), size, mtime,
+                  ctx, kv_k.c_str(), kv_v.c_str(),
+                  gpu.present ? gpu.name.c_str() : "no-gpu", gpu.total / MIB);
     return buf;
 }
 
@@ -574,6 +614,20 @@ int ladder_lookup(const std::string & key) {
     return found;
 }
 
+// mkdir -p for the cache directory. One level was not enough: it created
+// $XDG_CACHE_HOME/vipera but not $XDG_CACHE_HOME itself, and the fopen below
+// then failed silently - the ladder kept re-climbing on every start with no sign
+// that the memory it was meant to write was never written.
+bool make_dirs(const std::string & path) {
+    for (size_t i = 1; i < path.size(); ++i) {
+        if (path[i] != '/') {
+            continue;
+        }
+        ::mkdir(path.substr(0, i).c_str(), 0755);
+    }
+    return ::mkdir(path.c_str(), 0755) == 0 || errno == EEXIST;
+}
+
 void ladder_remember(const std::string & key, int n) {
     const std::string path = ladder_path();
     if (path.empty()) {
@@ -581,10 +635,14 @@ void ladder_remember(const std::string & key, int n) {
     }
     const size_t slash = path.rfind('/');
     if (slash != std::string::npos) {
-        ::mkdir(path.substr(0, slash).c_str(), 0755);
+        make_dirs(path.substr(0, slash));
     }
     FILE * f = std::fopen(path.c_str(), "a");
     if (f == nullptr) {
+        std::fprintf(stderr,
+                     "vipera: note: cannot write the ladder memory at %s (%s);\n"
+                     "        every start will probe again\n",
+                     path.c_str(), std::strerror(errno));
         return;
     }
     std::fprintf(f, "%s\t%d\n", key.c_str(), n);
@@ -605,12 +663,24 @@ void ladder_remember(const std::string & key, int n) {
 // a clean process and the ladder never pays for two generations.
 int run_ffn_ladder(int argc, char ** argv, const std::string & model) {
     // One message for a bad path beats sixty child processes each reporting it.
+    // The magic is checked for the same reason: a truncated download or an HTML
+    // error page saved as .gguf opens fine and then fails inside
+    // llama_model_load_from_file, which a probe has to report as "this rung does
+    // not fit" - so the ladder would climb all 64 rungs before admitting the
+    // file cannot be read. Whatever is wrong with those bytes, more FFN on the
+    // CPU will not fix it.
     FILE * f = std::fopen(model.c_str(), "rb");
     if (!f) {
         std::fprintf(stderr, "error: cannot open %s: %s\n", model.c_str(), std::strerror(errno));
         return 1;
     }
+    char magic[4] = {0, 0, 0, 0};
+    const size_t got = std::fread(magic, 1, sizeof(magic), f);
     std::fclose(f);
+    if (got != sizeof(magic) || std::memcmp(magic, "GGUF", 4) != 0) {
+        std::fprintf(stderr, "error: %s is not a GGUF file (or is truncated)\n", model.c_str());
+        return 1;
+    }
 
     int value_idx = -1;
     for (int i = 1; i < argc; ++i) {
@@ -635,8 +705,16 @@ int run_ffn_ladder(int argc, char ** argv, const std::string & model) {
         else if (a == "-ctk") { want_kv_k = argv[i + 1]; }
         else if (a == "-ctv") { want_kv_v = argv[i + 1]; }
     }
+    // The answer depends on the card as much as on the file (see ladder_key), so
+    // the parent reads the card from ggml's registry - the same source the fit
+    // uses - before deciding whether a remembered rung applies. This initialises
+    // the backends here; the children pay for that anyway, and no weight is
+    // loaded in this process.
+    llama_log_set(log_forward, nullptr);
+    llama_backend_init();
+    const Device gpu = first_gpu();
     const std::string key = ladder_key(model, want_ctx, want_kv_k,
-                                       want_kv_v.empty() ? want_kv_k : want_kv_v);
+                                       want_kv_v.empty() ? want_kv_k : want_kv_v, gpu);
 
     std::vector<std::string> args(argv, argv + argc);
     int first_rung = 1;
@@ -690,6 +768,221 @@ int run_ffn_ladder(int argc, char ** argv, const std::string & model) {
 }
 
 }  // namespace
+
+// What a generation loop produced, so the loop does not also own the report.
+struct GenerateStats {
+    std::vector<double> token_ms;   // one sample per token produced, in print order
+    int n_generated      = 0;
+    int n_draft_proposed = 0;
+    int n_draft_accepted = 0;
+    int n_verify_steps   = 0;
+    int pos              = 0;       // context positions consumed
+    double seconds       = 0.0;     // decode window, first sampling excluded
+};
+
+// Decode up to `opt.n_predict` tokens, printing each as it is produced.
+//
+// `spec` is null for plain decode, one sampled token per pass. With a drafter,
+// the carried token and the draft share one verify batch and the cache is rolled
+// back to the accepted prefix. Returns false when the target decode or that
+// rollback fails; this function owns no resource, so the caller keeps the single
+// teardown path - including freeing the backend after the drafter, whose deleter
+// may own llama contexts.
+static bool generate(llama_context * ctx, const llama_vocab * vocab, const Options & opt,
+                     llama_sampler * sampler, llama_batch_ext * batch,
+                     common_speculative * spec, llama_tokens & history,
+                     int n_ctx, int pos0, GenerateStats & st) {
+    int pos = pos0;
+    const int budget = std::min(opt.n_predict, n_ctx - pos);
+    st.token_ms.reserve((size_t) std::max(0, budget));
+    llama_tokens draft;
+    // `next` is sampled but neither printed nor fed yet: with a draft beside it
+    // it goes into the same batch as the draft tokens and shares their pass.
+    llama_token next = llama_sampler_sample(sampler, ctx, -1);
+    const double t_gen_start = now_s();
+    while (st.n_generated < budget) {
+        if (llama_vocab_is_eog(vocab, next)) {
+            break;
+        }
+
+        draft.clear();
+        if (spec) {
+            // Leave room for the token after the drafts and for the two the
+            // context keeps for a shift, exactly as the server's slot does.
+            const int n_max = std::min(std::min(opt.spec_n, budget - st.n_generated - 1),
+                                       n_ctx - pos - 2);
+            if (n_max > 0) {
+                common_speculative_draft_params & dp =
+                        common_speculative_get_draft_params(spec, 0);
+                dp = common_speculative_draft_params{};
+                dp.drafting = true;
+                dp.n_max    = n_max;
+                dp.pos0     = (llama_pos) pos;
+                dp.id_last  = next;
+                dp.prompt   = &history;
+                dp.result   = &draft;
+                common_speculative_draft(spec);
+            }
+        }
+
+        const double t0 = now_s();
+        if (!draft.empty()) {
+            // One batch: the sampled token plus every draft token, logits on
+            // every row, because row i holds the token at pos + i and decides
+            // the one after it.
+            llama_batch_ext_clear(batch);
+            for (size_t i = 0; i <= draft.size(); ++i) {
+                const int idx = llama_batch_ext_add_token(batch, 0,
+                                                          i == 0 ? next : draft[i - 1]);
+                const llama_pos p = (llama_pos) (pos + (int) i);
+                llama_batch_ext_set_pos(batch, idx, &p);
+                llama_batch_ext_set_output_logits(batch, idx, true);
+            }
+            if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch)) {
+                std::fprintf(stderr, "error: verify decode failed at token %d\n", st.n_generated);
+                return false;
+            }
+            llama_synchronize(ctx);
+
+            // Sample row by row and keep the prefix that matches the draft. The
+            // last sample is a new token even when every draft was accepted:
+            // the row after the last draft predicts it, which is why a fully
+            // accepted pass yields one more token than it proposed.
+            llama_tokens accepted;
+            accepted.reserve(draft.size() + 1);
+            // The scan that decides how much of this pass survives - and so how
+            // much KV is rolled back - lives in accept.h so it can be tested
+            // without a model.
+            const int n_keep = (int) accepted_rows(draft, [&](size_t i) {
+                const llama_token t = llama_sampler_sample(sampler, ctx, (int) i);
+                accepted.push_back(t);
+                return t;
+            });
+
+            // The rows past the accepted prefix are already in the cache and
+            // would be read as context by the next batch; drop them.
+            if (!llama_memory_seq_rm(llama_get_memory(ctx), 0,
+                                     (llama_pos) (pos + n_keep), -1)) {
+                std::fprintf(stderr,
+                             "error: cannot roll the KV cache back over the rejected drafts\n");
+                return false;
+            }
+
+            // Tell the drafter how many of its proposals survived - the count is
+            // the accepted prefix without the carried token. The server makes
+            // the same call after its verify pass; skipping it leaves the
+            // drafter's statistics at zero and any implementation that keeps
+            // state between steps reasoning from a stale picture.
+            common_speculative_accept(spec, 0, (uint16_t) (n_keep - 1));
+
+            const double dt_ms = (now_s() - t0) * 1000.0;
+
+            // Printed in the order the model produced them: the carried token
+            // first, then the drafts it confirmed. accepted.back() is carried
+            // and printed at the top of the next pass.
+            emit_token(vocab, next);
+            ++st.n_generated;
+            bool stop = false;
+            for (int i = 0; i + 1 < n_keep; ++i) {
+                if (llama_vocab_is_eog(vocab, accepted[(size_t) i])) {
+                    stop = true;
+                    break;
+                }
+                emit_token(vocab, accepted[(size_t) i]);
+                ++st.n_generated;
+            }
+            // One per-token sample for every token this pass produced, so a
+            // fast pass reads as fast tokens instead of one long one.
+            for (int i = 0; i < n_keep; ++i) {
+                st.token_ms.push_back(dt_ms / (double) n_keep);
+            }
+
+            // The cache now ends at the last matched draft; the carried token
+            // is the only one of this pass the model has not seen yet.
+            history.push_back(next);
+            history.insert(history.end(), accepted.begin(), accepted.end() - 1);
+
+            st.n_verify_steps += 1;
+            st.n_draft_proposed += (int) draft.size();
+            st.n_draft_accepted += n_keep - 1;
+            pos += n_keep;
+            next = accepted.back();
+
+            if (stop) {
+                break;
+            }
+        } else {
+            emit_token(vocab, next);
+
+            batch_set(batch, &next, 1, pos, true);
+            if (llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch)) {
+                std::fprintf(stderr, "error: decode failed at token %d\n", st.n_generated);
+                return false;
+            }
+            // Same reason as above: llama.cpp's decode is asynchronous, so the
+            // wait lands in whichever call next reads the output. Measured
+            // without this, a 13 ms token reported a 0.3 ms median (75 t/s
+            // decode alongside "median 0.31 ms"); the synchronize moves the
+            // wait into the window that claims to measure it and costs nothing
+            // - the sampler below would have blocked for exactly as long.
+            llama_synchronize(ctx);
+            st.token_ms.push_back((now_s() - t0) * 1000.0);
+
+            history.push_back(next);
+            ++pos;
+            ++st.n_generated;
+            next = llama_sampler_sample(sampler, ctx, -1);
+        }
+    }
+    st.pos     = pos;
+    st.seconds = now_s() - t_gen_start;
+    return true;
+}
+
+// The run report: prompt, generation, per-token and drafter numbers in one
+// place. Everything it prints arrives as an argument, so main cannot report a
+// window it no longer owns and the statistics cannot pick up a stale one.
+static void report(const Plan & plan, const GenerateStats & gen, const Options & opt,
+                   int n_prompt, double prefill_s, bool spec_on) {
+    // First generated token's cost includes the sample of the prefill's logits,
+    // so it is excluded from the per-token statistics and reported separately.
+    std::vector<double> steady(
+        gen.token_ms.size() > 1
+            ? std::vector<double>(gen.token_ms.begin() + 1, gen.token_ms.end())
+            : std::vector<double>());
+    std::sort(steady.begin(), steady.end());
+    const double gen_s = gen.seconds;
+
+    std::printf("\n\n");
+    std::printf("  prompt         %7.1f t/s  (%d tokens, %.2f s)\n",
+                n_prompt / std::max(1e-9, prefill_s), n_prompt, prefill_s);
+    if (!opt.warmup) {
+        // Say it rather than let the number look wrong: this is the graph
+        // allocation, and it lands here because the prefill is synchronised.
+        std::printf("  note           the first prefill carries the one-time graph allocation;\n"
+                    "                 --warmup moves it into a one-token decode\n");
+    }
+    if (gen.n_generated > 0) {
+        std::printf("  generation     %7.2f t/s  (%d tokens, %.2f s)\n",
+                    gen.n_generated / std::max(1e-9, gen_s), gen.n_generated, gen_s);
+        if (!steady.empty()) {
+            std::printf("  per token      median %.2f ms, p90 %.2f ms, first %.2f ms\n",
+                        median_sorted(steady), percentile_sorted(steady, 0.9),
+                        gen.token_ms.front());
+        }
+    }
+    if (spec_on) {
+        // Report what the drafter cost and bought: a low acceptance rate is the
+        // honest explanation for a --spec run that is slower than the plain one.
+        const double rate = gen.n_draft_proposed > 0
+                          ? (double) gen.n_draft_accepted / (double) gen.n_draft_proposed : 0.0;
+        std::printf("  spec           %d/%d draft tokens accepted (%.1f%%), %d verify steps\n",
+                    gen.n_draft_accepted, gen.n_draft_proposed, 100.0 * rate,
+                    gen.n_verify_steps);
+    }
+    std::printf("  kv used        %zu MiB of the %zu MiB planned\n",
+                plan.per_token * (size_t) gen.pos / MIB, plan.kv / MIB);
+}
 
 int main(int argc, char ** argv) {
     Options opt;
@@ -945,7 +1238,16 @@ int main(int argc, char ** argv) {
     if (device.present) {
         std::printf("  headroom       %zu MiB of the card kept free for the driver\n", margin / MIB);
     }
-    std::printf("  available      %zu MiB\n", available / MIB);
+    if (available > 0) {
+        std::printf("  available      %zu MiB\n", available / MIB);
+    } else {
+        // mem_available_bytes() returns 0 when /proc/meminfo cannot be read, and
+        // make_plan skips its RAM clamp in that case. Say so: a plan printed
+        // without the number it was clamped against is exactly the silent-wrong
+        // output this tool exists to avoid.
+        std::printf("  available      unknown (/proc/meminfo unreadable), so the KV\n"
+                    "                 cache was NOT budgeted against RAM\n");
+    }
     std::printf("  context        %d requested, %d used (train limit %d)\n",
                 opt.ctx > 0 ? opt.ctx : (requested > 0 ? requested : train), plan.ctx, train);
     if (plan.clamped) {
@@ -1094,73 +1396,62 @@ int main(int argc, char ** argv) {
     const double t_prefill_end = now_s();
 
     SamplerPtr sampler = make_sampler(opt);
-    const int budget = std::min(opt.n_predict, n_ctx - pos);
-    std::vector<double> token_ms;
-    token_ms.reserve((size_t) std::max(0, budget));
-    int n_generated = 0;
-    const double t_gen_start = now_s();
-    while (n_generated < budget) {
-        const llama_token id = llama_sampler_sample(sampler.get(), ctx.get(), -1);
-        if (llama_vocab_is_eog(vocab, id)) {
-            break;
-        }
-        char buf[256];
-        const int n = llama_token_to_piece(vocab, id, buf, sizeof(buf), 0, true);
-        if (n > 0) {
-            // Written and flushed per token. Buffering until a token happened
-            // to contain a newline left text without one invisible until the
-            // generation finished.
-            std::fwrite(buf, 1, (size_t) n, stdout);
-            std::fflush(stdout);
-        }
 
-        const double t0 = now_s();
-        batch_set(batch.get(), &id, 1, pos, true);
-        if (llama_process(ctx.get(), LLAMA_PROCESS_TYPE_DECODE, batch.get())) {
-            std::fprintf(stderr, "error: decode failed at token %d\n", n_generated);
+    // Self-speculation. The drafter is the n-gram map in common/: it indexes
+    // the prompt the model was just given and proposes the tokens that followed
+    // the same n-gram before, so the model can check several tokens in one pass
+    // instead of one per pass. Placement is untouched - no weights, no KV dtype,
+    // no layer given up - and the only cost is a wider batch on the verify step,
+    // which the context already budgets for through n_batch.
+    common_speculative_ptr spec;
+    llama_tokens history = prompt_tokens;
+    // Rejecting a draft means cutting the cache back to the accepted prefix,
+    // and recurrent / hybrid attention cannot drop part of a sequence: the
+    // removal below would fail after the run had already printed. The server
+    // survives that with a checkpoint replay; this tool keeps no such state, so
+    // the honest answer is to decode plainly and say why.
+    const bool spec_supported = !llama_model_is_recurrent(model.get())
+                             && !llama_model_is_hybrid(model.get());
+    if (opt.spec != "off" && !spec_supported) {
+        std::fprintf(stderr,
+                     "note: --spec is off for this model: recurrent and hybrid attention\n"
+                     "      cannot roll the KV cache back over a rejected draft, so this\n"
+                     "      run decodes plainly\n");
+    }
+    if (opt.spec != "off" && spec_supported) {
+        common_params_speculative spec_params;
+        try {
+            spec_params.types = common_speculative_types_from_names({ opt.spec });
+        } catch (const std::exception &) {
+            // A typo would otherwise decode normally and look like the flag did
+            // nothing, which is the silent-wrong this tool exists to refuse.
+            std::fprintf(stderr,
+                         "error: unknown --spec '%s'; try ngram-map-k, ngram-map-k4v, "
+                         "ngram-simple or ngram-mod\n", opt.spec.c_str());
             llama_backend_free();
             return 1;
         }
-        // Same reason as above: llama.cpp's decode is asynchronous, so the
-        // wait lands in whichever call next reads the output. Measured without
-        // this, a 13 ms token reported a 0.3 ms median (75 t/s decode alongside
-        // "median 0.31 ms"); the synchronize moves the wait into the window
-        // that claims to measure it and costs nothing - the sampler below would
-        // have blocked for exactly as long.
-        llama_synchronize(ctx.get());
-        token_ms.push_back((now_s() - t0) * 1000.0);
-
-        ++pos;
-        ++n_generated;
-    }
-    const double t_gen_end = now_s();
-
-    // First generated token's cost includes the sample of the prefill's logits,
-    // so it is excluded from the per-token statistics and reported separately.
-    std::vector<double> steady(token_ms.size() > 1 ? std::vector<double>(token_ms.begin() + 1, token_ms.end())
-                                                   : std::vector<double>());
-    std::sort(steady.begin(), steady.end());
-    const double prefill_s = t_prefill_end - t_prefill_start;
-    const double gen_s = t_gen_end - t_gen_start;
-
-    std::printf("\n\n");
-    std::printf("  prompt         %7.1f t/s  (%d tokens, %.2f s)\n",
-                n_prompt / std::max(1e-9, prefill_s), n_prompt, prefill_s);
-    if (!opt.warmup) {
-        // Say it rather than let the number look wrong: this is the graph
-        // allocation, and it lands here because the prefill is synchronised.
-        std::printf("  note           the first prefill carries the one-time graph allocation;\n"
-                    "                 --warmup moves it into a one-token decode\n");
-    }
-    if (n_generated > 0) {
-        std::printf("  generation     %7.2f t/s  (%d tokens, %.2f s)\n",
-                    n_generated / std::max(1e-9, gen_s), n_generated, gen_s);
-        if (!steady.empty()) {
-            std::printf("  per token      median %.2f ms, p90 %.2f ms, first %.2f ms\n",
-                        median_sorted(steady), percentile_sorted(steady, 0.9), token_ms.front());
+        spec.reset(common_speculative_init(spec_params, 1));
+        if (!spec) {
+            std::fprintf(stderr, "error: --spec %s could not start\n", opt.spec.c_str());
+            llama_backend_free();
+            return 1;
         }
+        common_speculative_begin(spec.get(), 0, history);
+        std::printf("  spec           %s, up to %d draft tokens per step, %zu prompt tokens indexed\n",
+                    opt.spec.c_str(), common_speculative_n_max(spec.get()), history.size());
+        std::fflush(stdout);
     }
-    std::printf("  kv used        %zu MiB of the %zu MiB planned\n",
-                plan.per_token * (size_t) pos / MIB, plan.kv / MIB);
+
+    GenerateStats gen;
+    if (!generate(ctx.get(), vocab, opt, sampler.get(), batch.get(), spec.get(),
+                  history, n_ctx, pos, gen)) {
+        // Before the backend: the drafter's deleter may own llama contexts.
+        spec.reset();
+        llama_backend_free();
+        return 1;
+    }
+
+    report(plan, gen, opt, n_prompt, t_prefill_end - t_prefill_start, spec != nullptr);
     return 0;
 }

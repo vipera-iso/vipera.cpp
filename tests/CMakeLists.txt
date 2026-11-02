@@ -166,6 +166,20 @@ if (LLAMA_LLGUIDANCE)
     llama_build_and_test(test-grammar-llguidance.cpp ARGS ${PROJECT_SOURCE_DIR}/models/ggml-vocab-llama-bpe.gguf)
 endif ()
 
+# the vipera tool's draft-acceptance scan: pure logic, no model needed
+llama_build_and_test(test-vipera-accept.cpp)
+
+# --spec must refuse a model whose cache cannot be rolled back, and finish the
+# run plainly. Skips (77) unless VIPERA_SPEC_RECURRENT_MODEL names such a model.
+if (NOT WIN32)
+    llama_test_cmd(
+        ${CMAKE_CURRENT_SOURCE_DIR}/test-vipera-spec-recurrent.sh
+        NAME test-vipera-spec-recurrent
+        ARGS $<TARGET_FILE:vipera>
+    )
+    set_tests_properties(test-vipera-spec-recurrent PROPERTIES SKIP_RETURN_CODE 77)
+endif()
+
 # llama_context state tests: KV and recurrent state save, load, copy, rollback
 set(LLAMA_CONTEXT_TEST_SRC
     test-llama-context.cpp
