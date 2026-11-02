@@ -27,7 +27,12 @@ else()
         add_subdirectory(server)
     endif()
     add_subdirectory(tokenize)
-    add_subdirectory(vipera)
+    # vipera reads /proc for RAM and physical cores and re-execs /proc/self/exe
+    # for its -ncffn probe ladder, so it is Linux-only: sys/wait.h does not
+    # exist for MSVC, and macOS has the headers but no /proc.
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_subdirectory(vipera)
+    endif()
     add_subdirectory(tts)
     add_subdirectory(mtmd)
     if (GGML_RPC)
