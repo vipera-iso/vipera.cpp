@@ -27,6 +27,19 @@ env:
   LLAMA_ARG_LOG_TIMESTAMPS: 1
 
 jobs:
+  # A workflow with no jobs cannot be loaded: GitHub then ignores this file's
+  # triggers and records a failed push run with zero jobs, which is what the red
+  # check on every push was. One real job keeps the file valid, and it only ever
+  # runs when dispatched by hand.
+  disabled:
+    runs-on: ubuntu-slim
+    steps:
+      - name: Say why nothing is built
+        run: |
+          echo "The CANN build is disabled: it needs dedicated Ascend runners."
+          echo "Upstream removed the job in ggml-org/llama.cpp#23705."
+          echo "The commented job below is the one to restore."
+
 # TODO: this build is disabled to save Github Actions resources (https://github.com/ggml-org/llama.cpp/pull/23705)
 #       in order to enable it again, we have to provision dedicated runners  to run it
 #  openEuler-latest-cann:
