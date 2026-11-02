@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - master
+      - main
     paths: [
       'vendor/**',
       'scripts/sync_vendor.py'

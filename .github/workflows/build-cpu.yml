@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - master
+      - main
     paths: [
       '.github/workflows/build-cpu.yml',
       '.github/workflows/build-cmake-pkg.yml',

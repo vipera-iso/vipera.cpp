@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - master
+      - main
     paths: [
       '.github/workflows/python-lint.yml',
       '**/*.py'
