@@ -14,13 +14,124 @@
 #include "llama-sampler.h"
 #include "llama.h"
 
+#include "ggml-backend.h"
+
+#include <algorithm>
 #include <cinttypes>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+#include <utility>
+#include <vector>
+
+//
+// vipera: optional MoE routing-trace capture.
+//
+// Set LLAMA_MOE_TRACE=<path> to dump one JSON line per decoded token:
+//
+//   {"t": 0, "layers": [[e0, e1, ...], [...], ...]}
+//
+// `layers[l]` is the list of expert ids the router selected at MoE layer l for
+// that token (the `ffn_moe_topk` tensor, which llama.cpp already names per layer).
+// Only per-token decode steps (ubatch.n_tokens == 1) are recorded - exactly the
+// routing a decode-time expert cache sees. This is a local fork patch for vipera;
+// it changes no computation, only marks the router tensors as graph outputs and
+// reads them back after compute.
+static const char * llama_moe_trace_path() {
+    static const char * path = getenv("LLAMA_MOE_TRACE");
+    return path;
+}
+
+static void llama_moe_dump_trace(ggml_cgraph * gf) {
+    // One router tensor found in the graph: the layer it belongs to, where it
+    // sits in the node list, and the tensor itself (for identity only).
+    struct entry {
+        int il;
+        int idx;
+        ggml_tensor * t;
+    };
+
+    struct trace_state {
+        FILE *  fp     = nullptr;
+        bool    failed = false;  // the file could not be opened; do not ask again
+        int64_t step   = 0;
+        // The router tensors of a graph are fixed for as long as that graph is
+        // used, and llama.cpp reuses one graph for every decode step whose
+        // topology matches. Scanning the node list and sscanf'ing a name per
+        // node on every token was pure overhead on the decode path, so the scan
+        // runs once per graph build. A rebuilt graph can land on the address the
+        // previous one had, so the cache is validated by comparing the node at
+        // each recorded index with the tensor it held: pointer compares only, a
+        // stale pointer is never dereferenced.
+        const ggml_cgraph * graph   = nullptr;
+        int                 n_nodes = -1;
+        std::vector<entry>  found;
+    };
+    static trace_state st;
+
+    if (st.failed) {
+        return;
+    }
+    if (st.fp == nullptr) {
+        st.fp = fopen(llama_moe_trace_path(), "w");
+        if (st.fp == nullptr) {
+            // Once, not once per decoded token: the next step would ask the same
+            // question of the same path and fail the same way, and a trace that
+            // is off must not turn a run into a wall of errors.
+            LLAMA_LOG_ERROR("%s: cannot open %s\n", __func__, llama_moe_trace_path());
+            st.failed = true;
+            return;
+        }
+    }
+
+    const int n_nodes = ggml_graph_n_nodes(gf);
+    bool cached = st.graph == gf && st.n_nodes == n_nodes;
+    for (size_t j = 0; cached && j < st.found.size(); ++j) {
+        cached = ggml_graph_node(gf, st.found[j].idx) == st.found[j].t;
+    }
+    if (!cached) {
+        st.found.clear();
+        for (int i = 0; i < n_nodes; ++i) {
+            ggml_tensor * t = ggml_graph_node(gf, i);
+            if (t == nullptr || t->name[0] == '\0') {
+                continue;
+            }
+            int il = -1;
+            if (sscanf(t->name, "ffn_moe_topk-%d", &il) == 1) {
+                st.found.push_back({ il, i, t });
+            }
+        }
+        std::sort(st.found.begin(), st.found.end(),
+                  [](const entry & a, const entry & b) { return a.il < b.il; });
+        st.graph   = gf;
+        st.n_nodes = n_nodes;
+    }
+    if (st.found.empty()) {
+        return;
+    }
+
+    fprintf(st.fp, "{\"t\":%lld,\"layers\":[", (long long) st.step);
+    for (size_t j = 0; j < st.found.size(); ++j) {
+        // Read through the current graph, never through the cached pointer.
+        ggml_tensor * t = ggml_graph_node(gf, st.found[j].idx);
+        const int64_t n = ggml_nelements(t);
+        std::vector<int32_t> ids(n);
+        ggml_backend_tensor_get(t, ids.data(), 0, n * (int64_t) sizeof(int32_t));
+        fprintf(st.fp, "%s[", j ? "," : "");
+        for (int64_t k = 0; k < n; ++k) {
+            fprintf(st.fp, "%s%d", k ? "," : "", ids[k]);
+        }
+        fprintf(st.fp, "]");
+    }
+    fprintf(st.fp, "]}\n");
+    fflush(st.fp);
+    st.step++;
+}
 
 //
 // llama_context
@@ -1574,6 +1685,11 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         return nullptr;
     }
 
+    // vipera: capture the router's expert selection for this decode step.
+    if (llama_moe_trace_path() != nullptr && ubatch.n_tokens == 1) {
+        llama_moe_dump_trace(gf);
+    }
+
     ret = GGML_STATUS_SUCCESS;
 
     return res;
@@ -2845,6 +2961,11 @@ bool llama_context::sched_copy_experts(ggml_backend_t backend, const ggml_tensor
 
 llm_graph_cb llama_context::graph_get_cb() const {
     return [&](const llama_ubatch & ubatch, ggml_tensor * cur, const char * name, int il) {
+        // vipera: keep the router's selected experts alive so they can be read
+        // back after the graph runs (see llama_moe_dump_trace).
+        if (llama_moe_trace_path() != nullptr && strcmp(name, "ffn_moe_topk") == 0) {
+            ggml_set_output(cur);
+        }
         if (il >= 0) {
             ggml_format_name(cur, "%s-%d", name, il);
         } else {
