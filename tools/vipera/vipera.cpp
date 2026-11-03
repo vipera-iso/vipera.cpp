@@ -16,6 +16,7 @@
 #include "gguf.h"
 #include "fit.h"
 #include "place.h"
+#include "plan_json.h"
 #include "speculative.h"
 
 #include <algorithm>
@@ -353,6 +354,9 @@ struct Options {
     std::string spec = "off";
     int spec_n = 48;            // draft tokens proposed per step
     bool plan_only = false;
+    // --json is only meaningful with --plan: a run reports itself with numbers
+    // that arrive after the answer, not as one object printed up front.
+    bool json = false;
     // Internal: print "name|total|free" for the first GPU and exit. The ladders
     // read the card through this so the process that spawns them never
     // initialises CUDA (see device_from_child).
@@ -419,6 +423,8 @@ void print_usage(const char * argv0) {
         "                  ngram-simple, ngram-mod; 'off' is the default\n"
         "  --spec-n N      draft tokens per step (default 48)\n"
         "  --plan          print the plan and exit (loads metadata only)\n"
+        "  --json          with --plan: print it as one JSON object instead of\n"
+        "                  prose, so a caller does not have to parse English\n"
         "  --warmup        decode one token first so the prompt starts from a\n"
         "                  warm graph (costs that one token, ~2%% of prompt)\n"
         "  --no-warmup     accepted for compatibility; it is the default\n"
@@ -432,6 +438,7 @@ bool parse_args(int argc, char ** argv, Options & o) {
         const bool has_value = i + 1 < argc;
         if (a == "-h" || a == "--help") { o.help = true; return true; }
         else if (a == "--plan")     { o.plan_only = true; }
+        else if (a == "--json")     { o.json = true; }
         else if (a == "--device")   { o.device_only = true; }
         else if (a == "-nkvo" || a == "--no-kv-offload") { o.kv_mode = -1; }
         else if (a == "--warmup")   { o.warmup = true; }
@@ -1449,6 +1456,12 @@ int main(int argc, char ** argv) {
         print_usage(argv[0]);
         return 0;
     }
+    if (opt.json && !opt.plan_only) {
+        // Rather than print a plan nobody asked for and then run anyway: a
+        // caller piping this got one object, and a run's output would corrupt it.
+        std::fprintf(stderr, "error: --json only applies to --plan\n");
+        return 2;
+    }
     if (opt.device_only) {
         // Answers the ladders' question without loading a weight. The context this
         // creates dies with this process, which is the whole point.
@@ -1690,11 +1703,60 @@ int main(int argc, char ** argv) {
     const int threads = opt.threads > 0 ? opt.threads : physical_cores();
     const int train = llama_model_n_ctx_train(model.get());
 
+    const int head_dim = llama_model_n_embd(model.get()) /
+                         std::max(1, llama_model_n_head(model.get()));
+
+    // One object with the same values the prose below prints, for callers. Built
+    // before the block so a missing field is a compile error, not a silent
+    // omission in the JSON.
+    plan_report plan_data;
+    plan_data.path            = opt.model;
+    plan_data.model_mib       = model_bytes / MIB;
+    plan_data.n_layer         = llama_model_n_layer(model.get());
+    plan_data.n_head_kv       = llama_model_n_head_kv(model.get());
+    plan_data.head_dim        = head_dim;
+    plan_data.train_ctx       = train;
+    plan_data.has_gpu         = device.present;
+    plan_data.gpu_name        = device.name;
+    plan_data.gpu_total_mib   = device.total / MIB;
+    plan_data.gpu_free_mib    = device.free / MIB;
+    plan_data.headroom_mib    = margin / MIB;
+    plan_data.auto_placement  = auto_placement;
+    plan_data.fit_failed      = fit_failed;
+    plan_data.ffn_split       = ffn_split;
+    plan_data.gpu_layers      = gpu_layers;
+    plan_data.ffn_on_cpu      = ffn_split ? opt.n_cpu_ffn : 0;
+    plan_data.kv_k            = opt.kv_k;
+    plan_data.kv_v            = opt.kv_v.empty() ? opt.kv_k : opt.kv_v;
+    plan_data.kv_mib          = plan.kv / MIB;
+    plan_data.kv_lowered      = kv_lowered;
+    plan_data.kv_in_ram       = !cparams.offload_kqv;
+    plan_data.resident_mib    = resident / MIB;
+    plan_data.available_mib   = available / MIB;
+    plan_data.available_known = available > 0;
+    plan_data.ctx_requested   = opt.ctx > 0 ? opt.ctx : (requested > 0 ? requested : train);
+    plan_data.ctx_used        = plan.ctx;
+    plan_data.clamped         = plan.clamped;
+    plan_data.limited_by_train = plan.limited_by_train;
+    plan_data.clamp_reason    = plan.reason;
+    plan_data.threads         = threads;
+    if (opt.json) {
+        // Machine-readable: no prose before it, nothing after it, so a caller can
+        // read the whole of stdout as one object.
+        std::printf("%s", plan_json(plan_data).c_str());
+        std::fflush(stdout);
+        // The backend is freed while `model` is still alive, and the model's
+        // destructor runs on return. That is the order llama.cpp's own tools use
+        // (tools/completion), and llama.h calls this free "currently only used
+        // for MPI", so it is not a teardown the model depends on.
+        llama_backend_free();
+        return 0;
+    }
+
     std::printf("\nvipera plan\n");
     std::printf("  model          %zu MiB, %d layers, %d kv heads, head dim %d\n",
                 model_bytes / MIB, llama_model_n_layer(model.get()),
-                llama_model_n_head_kv(model.get()),
-                llama_model_n_embd(model.get()) / std::max(1, llama_model_n_head(model.get())));
+                llama_model_n_head_kv(model.get()), head_dim);
     // The placement comes first: it decides what the rest of the plan means.
     if (device.present) {
         std::printf("  gpu            %s, %zu MiB free / %zu MiB\n",
@@ -1780,6 +1842,7 @@ int main(int argc, char ** argv) {
     // follows this block would otherwise appear before the plan it refers to.
     std::fflush(stdout);
     if (opt.plan_only) {
+        // Same order as the --json branch above.
         llama_backend_free();
         return 0;
     }

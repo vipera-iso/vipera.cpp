@@ -172,6 +172,10 @@ llama_build_and_test(test-vipera-accept.cpp)
 # the vipera tool's placement bisection: pure logic, no model or GPU needed
 llama_build_and_test(test-vipera-place.cpp)
 
+# the vipera tool's --plan --json object: escaping and null-vs-zero rules, pure
+# formatting, no model needed
+llama_build_and_test(test-vipera-plan-json.cpp)
+
 # the MoE expert cache's eviction policy, against a model of it: pure logic, no
 # model file or device needed
 llama_build_and_test(test-vipera-moe-cache-lru.cpp)
