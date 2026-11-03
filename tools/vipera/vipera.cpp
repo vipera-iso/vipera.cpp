@@ -13,7 +13,9 @@
 #include "accept.h"
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "gguf.h"
 #include "fit.h"
+#include "place.h"
 #include "speculative.h"
 
 #include <algorithm>
@@ -216,6 +218,58 @@ Device first_gpu() {
     return d;
 }
 
+// Ask a child what card this binary sees.
+//
+// The parent cannot call first_gpu() itself: that initialises CUDA in this
+// process, the primary context lives until the process exits, and llama_backend_free()
+// does not reclaim it - so every rung would be charged for the parent's own
+// allocation. Measured on the reference 4 GB card, that was exactly one FFN
+// block: with the parent holding a context the search chose 7, while a
+// standalone `-ncffn 6` loads at 20 t/s. The child exits, so nothing survives it.
+Device device_from_child() {
+    int fds[2];
+    if (pipe(fds) != 0) {
+        return Device{};
+    }
+    const pid_t pid = fork();
+    if (pid < 0) {
+        close(fds[0]);
+        close(fds[1]);
+        return Device{};
+    }
+    if (pid == 0) {
+        close(fds[0]);
+        dup2(fds[1], STDOUT_FILENO);
+        close(fds[1]);
+        char * child_argv[] = {const_cast<char *>("vipera"), const_cast<char *>("--device"),
+                               nullptr};
+        execv("/proc/self/exe", child_argv);
+        _exit(127);
+    }
+    close(fds[1]);
+    char buf[512] = {0};
+    const ssize_t got = read(fds[0], buf, sizeof(buf) - 1);
+    close(fds[0]);
+    int status = 0;
+    waitpid(pid, &status, 0);
+
+    Device d;
+    if (got <= 0) {
+        return d;
+    }
+    const std::string line(buf);
+    const size_t a = line.find('|');
+    const size_t b = line.find('|', a + 1);
+    if (a == std::string::npos || b == std::string::npos) {
+        return d;
+    }
+    d.name = line.substr(0, a);
+    d.total = (size_t) std::strtoull(line.substr(a + 1, b - a - 1).c_str(), nullptr, 10);
+    d.free = (size_t) std::strtoull(line.substr(b + 1).c_str(), nullptr, 10);
+    d.present = d.total > 0;
+    return d;
+}
+
 // ------------------------------------------------------------------- plan ----
 
 struct Plan {
@@ -287,7 +341,7 @@ struct Options {
     bool ffn_auto = false;
     // Internal, set on the probe children the ladder spawns: load, create the
     // context, report, exit. Never a user-facing mode.
-    bool ffn_probe = false;
+    bool probe = false;
     float temp = 0.0f;          // 0 = greedy
     float top_p = 0.95f;
     float min_p = 0.05f;
@@ -299,7 +353,14 @@ struct Options {
     std::string spec = "off";
     int spec_n = 48;            // draft tokens proposed per step
     bool plan_only = false;
+    // Internal: print "name|total|free" for the first GPU and exit. The ladders
+    // read the card through this so the process that spawns them never
+    // initialises CUDA (see device_from_child).
+    bool device_only = false;
     int kv_mode = 0;            // 0 = KV cache on the card, -1 = in RAM (-nkvo)
+    // Internal: this process only runs the -ngl ladder, for the -ngl that did
+    // not fit (see relaunch_for_ladder). Never set by a user-facing flag.
+    int ngl_ladder = 0;
     // Off by default: the prompt number below excludes the allocation because
     // the prefill is synchronised, so the warmup only costs its own token
     // (measured 387.8 vs 396.4 t/s prompt, 73.8 vs 73.4 decode, 1281-token
@@ -320,7 +381,9 @@ void print_usage(const char * argv0) {
         "  -ub N           batch size for one pass (default 512, max 1024: a\n"
         "                  larger batch needs compute buffers the card lacks;\n"
         "                  1024 prefilled 1655 tokens at 88.0 t/s against 84.3)\n"
-        "  -ngl N          layers on GPU; default fits the free VRAM (see --fit)\n"
+        "  -ngl N          layers on GPU; default fits the free VRAM (see --fit).\n"
+        "                  a split that does not load walks down to the most\n"
+        "                  layers that do, in child processes, and runs there\n"
         "  --fit on|off    place layers across GPU and RAM automatically (default on)\n"
         "  --fit-target N  MiB the fit must leave free on the card (default: a\n"
         "                  scaled one - card/16, at least 192, at most 512, where\n"
@@ -338,7 +401,10 @@ void print_usage(const char * argv0) {
         "                  cliff (measured 7B/4 GB: 5 fails, 6 runs). Costs a\n"
         "                  probe process per rung - ~1.5 s per rung that fails,\n"
         "                  plus the one that wins - each a child process, so no\n"
-        "                  VRAM leaks between attempts\n"
+        "                  VRAM leaks between attempts. When not even every\n"
+        "                  layer's attention fits, it falls back to -ngl M with\n"
+        "                  -ncffn M: attention and KV of M layers on the card,\n"
+        "                  their FFN in RAM, the rest of the stack on the CPU\n"
         "  -p TEXT         prompt (default \"The capital of France is\")\n"
         "  --kv TYPE       KV cache type for K and V (default f16)\n"
         "  -ctk/-ctv TYPE  set K and V separately\n"
@@ -366,6 +432,7 @@ bool parse_args(int argc, char ** argv, Options & o) {
         const bool has_value = i + 1 < argc;
         if (a == "-h" || a == "--help") { o.help = true; return true; }
         else if (a == "--plan")     { o.plan_only = true; }
+        else if (a == "--device")   { o.device_only = true; }
         else if (a == "-nkvo" || a == "--no-kv-offload") { o.kv_mode = -1; }
         else if (a == "--warmup")   { o.warmup = true; }
         else if (a == "--no-warmup"){ o.warmup = false; }
@@ -381,10 +448,18 @@ bool parse_args(int argc, char ** argv, Options & o) {
             const std::string v = argv[++i];
             // Same trap as -ngl auto: atoi("auto") means 0, which is the
             // classic split and would look applied while holding nothing back.
+            // A numeric value clears the ladder flag: the ladder's own children
+            // are launched by appending/patching this flag, and a child that
+            // still read "auto" would start the climb again inside itself.
             if (v == "auto") { o.ffn_auto = true; o.n_cpu_ffn = 0; }
-            else { o.n_cpu_ffn = std::atoi(v.c_str()); }
+            else { o.ffn_auto = false; o.n_cpu_ffn = std::atoi(v.c_str()); }
         }
-        else if (a == "--ncffn-probe") { o.ffn_probe = true; }
+        else if (a == "--ncffn-probe") { o.probe = true; }
+        // The -ngl ladder's probe child: one flag for "load, create the context,
+        // report, exit" instead of two that have to stay identical.
+        else if (a == "--ctx-probe") { o.probe = true; }
+        // Internal: run the -ngl ladder and nothing else (see relaunch_for_ladder).
+        else if (a == "--ngl-ladder" && has_value) { o.ngl_ladder = std::atoi(argv[++i]); }
         else if (a == "-ngl" && has_value) {
             const std::string v = argv[++i];
             // 'auto' spells the default; atoi("auto") would mean CPU-only.
@@ -413,7 +488,9 @@ bool parse_args(int argc, char ** argv, Options & o) {
             return false;
         }
     }
-    return !o.model.empty();
+    // --device answers without a model, which is what lets the ladders ask about
+    // the card before they have loaded anything.
+    return !o.model.empty() || o.device_only;
 }
 
 double now_s() {
@@ -509,6 +586,10 @@ constexpr int PROBE_NO_CONTEXT = 2;
 // No model on any card has needed a larger FFN-on-CPU count than this to make a
 // context; the ladder stops here rather than spin if the answer is "never".
 constexpr int FFN_LADDER_MAX = 64;
+// Upper bound for the mixed-placement search (stage B of `-ncffn auto`): no GGUF
+// stack has more layers than this, and the search is capped by llama.cpp's
+// override slots well before it.
+constexpr int SPLIT_LADDER_MAX = 200;
 
 int spawn_self(const std::vector<std::string> & args) {
     std::vector<char *> argv;
@@ -567,6 +648,13 @@ std::string ladder_path() {
     return base + "/vipera/ffn-ladder.txt";
 }
 
+// Longest key ladder_key() can build: path, size, mtime, -c, both KV types, the
+// card's name and its size. ladder_lookup() reads lines at least this long - a
+// shorter buffer splits a long path across two reads, the tab lands in the second
+// one, and the entry is never matched, so the ladder quietly forgets everything
+// it was told about a model whose path is deep enough.
+constexpr size_t LADDER_KEY_MAX = 1536;
+
 // The context and the KV type decide what fits, so both are part of the key: a
 // rung measured at 4096 is not the answer at 8192.
 std::string ladder_key(const std::string & model, int ctx, const std::string & kv_k,
@@ -582,7 +670,7 @@ std::string ladder_key(const std::string & model, int ctx, const std::string & k
     // blocks on it, and a rung remembered on the old card would be replayed
     // forever: the extra FFN on the CPU still *loads*, so the confirmation step
     // cannot catch it - the run just decodes slower for the rest of its life.
-    char buf[1536];
+    char buf[LADDER_KEY_MAX];
     std::snprintf(buf, sizeof(buf), "%s|%lld|%lld|%d|%s/%s|%s|%zuMiB", model.c_str(), size, mtime,
                   ctx, kv_k.c_str(), kv_v.c_str(),
                   gpu.present ? gpu.name.c_str() : "no-gpu", gpu.total / MIB);
@@ -598,7 +686,9 @@ int ladder_lookup(const std::string & key) {
     if (f == nullptr) {
         return 0;
     }
-    char line[1024];
+    // Room for the key, the tab and the value: the key alone can be
+    // LADDER_KEY_MAX bytes (see its definition).
+    char line[LADDER_KEY_MAX + 32];
     int found = 0;
     while (std::fgets(line, sizeof(line), f) != nullptr) {
         const std::string row(line);
@@ -649,6 +739,156 @@ void ladder_remember(const std::string & key, int n) {
     std::fclose(f);
 }
 
+// The model's layer count, or 0 when the header cannot answer. A stage B rung
+// past the depth is the same placement as the last one - all attention on the
+// card, every FFN in RAM - so the search must not start above it.
+int gguf_block_count(const std::string & model) {
+    struct gguf_init_params params = {
+        /* .no_alloc = */ true,
+        /* .ctx      = */ nullptr,
+    };
+    gguf_context * ctx = gguf_init_from_file(model.c_str(), params);
+    if (ctx == nullptr) {
+        return 0;
+    }
+    int depth = 0;
+    const int64_t arch = gguf_find_key(ctx, "general.architecture");
+    if (arch >= 0 && gguf_get_kv_type(ctx, arch) == GGUF_TYPE_STRING) {
+        const std::string key = std::string(gguf_get_val_str(ctx, arch)) + ".block_count";
+        const int64_t id = gguf_find_key(ctx, key.c_str());
+        if (id >= 0) {
+            depth = (int) gguf_get_val_u32(ctx, id);
+        }
+    }
+    gguf_free(ctx);
+    return depth;
+}
+
+// True when this file can be loaded at all - not merely when it starts with the
+// GGUF magic. Shared by every ladder, and it has to be this strict because a
+// probe reports *every* load failure as "this split does not fit": whatever the
+// file's actual problem is, a ladder that cannot tell it apart from an
+// out-of-VRAM rung walks its whole search and then blames the card.
+//
+// Everything below is checked without loading a weight, which is what makes it
+// cheap enough to run before a ladder: the magic (an HTML error page saved as
+// .gguf), the header itself, the architecture (`general.architecture` and
+// `<arch>.block_count` are what llama.cpp builds a model from), and that every
+// tensor lies inside the file - a truncated download keeps a valid header and
+// only fails once the loader reaches for bytes past the end.
+bool gguf_ok(const std::string & model) {
+    FILE * f = std::fopen(model.c_str(), "rb");
+    if (!f) {
+        std::fprintf(stderr, "error: cannot open %s: %s\n", model.c_str(), std::strerror(errno));
+        return false;
+    }
+    char magic[4] = {0, 0, 0, 0};
+    const size_t got = std::fread(magic, 1, sizeof(magic), f);
+    std::fclose(f);
+    if (got != sizeof(magic) || std::memcmp(magic, "GGUF", 4) != 0) {
+        std::fprintf(stderr, "error: %s is not a GGUF file (or is truncated)\n", model.c_str());
+        return false;
+    }
+    struct stat st {};
+    if (::stat(model.c_str(), &st) != 0) {
+        std::fprintf(stderr, "error: cannot stat %s: %s\n", model.c_str(), std::strerror(errno));
+        return false;
+    }
+    const size_t file_size = (size_t) st.st_size;
+
+    struct gguf_init_params params = {
+        /* .no_alloc = */ true,
+        /* .ctx      = */ nullptr,
+    };
+    gguf_context * ctx = gguf_init_from_file(model.c_str(), params);
+    if (ctx == nullptr) {
+        std::fprintf(stderr, "error: %s: the GGUF header cannot be read\n", model.c_str());
+        return false;
+    }
+    const int64_t arch = gguf_find_key(ctx, "general.architecture");
+    bool has_arch = arch >= 0 && gguf_get_kv_type(ctx, arch) == GGUF_TYPE_STRING;
+    std::string arch_name;
+    if (has_arch) {
+        arch_name = gguf_get_val_str(ctx, arch);
+        has_arch = gguf_find_key(ctx, (arch_name + ".block_count").c_str()) >= 0;
+    }
+    const int64_t n_tensors = gguf_get_n_tensors(ctx);
+    if (!has_arch || n_tensors <= 0) {
+        std::fprintf(stderr,
+                     "error: %s has no usable architecture or tensor list; llama.cpp cannot load\n"
+                     "       it, whatever the placement\n",
+                     model.c_str());
+        gguf_free(ctx);
+        return false;
+    }
+
+    const size_t data = gguf_get_data_offset(ctx);
+    for (int64_t i = 0; i < n_tensors; ++i) {
+        // Subtractions rather than one sum: the offsets come from the file, and a
+        // corrupt header can put them anywhere up to SIZE_MAX.
+        const size_t rel = gguf_get_tensor_offset(ctx, i);
+        const size_t size = gguf_get_tensor_size(ctx, i);
+        const bool outside = data > file_size || rel > file_size - data ||
+                             size > file_size - data - rel;
+        if (!outside) {
+            continue;
+        }
+        std::fprintf(stderr,
+                     "error: %s is truncated: tensor %s ends past the end of the file\n",
+                     model.c_str(), gguf_get_tensor_name(ctx, i));
+        gguf_free(ctx);
+        return false;
+    }
+    gguf_free(ctx);
+    return true;
+}
+
+// The context and the KV type both decide what fits, so both ladders put them in
+// their cache key; one scan keeps the two from disagreeing about the answer.
+struct Wanted {
+    int ctx = 0;
+    std::string kv_k = "f16";
+    std::string kv_v;
+
+    // -ctv left unset means V follows K.
+    const std::string & v_type() const { return kv_v.empty() ? kv_k : kv_v; }
+};
+
+Wanted scan_wanted(int argc, char ** argv) {
+    Wanted w;
+    for (int i = 1; i + 1 < argc; ++i) {
+        const std::string a = argv[i];
+        if (a == "-c") { w.ctx = std::atoi(argv[i + 1]); }
+        else if (a == "--kv") { w.kv_k = w.kv_v = argv[i + 1]; }
+        else if (a == "-ctk") { w.kv_k = argv[i + 1]; }
+        else if (a == "-ctv") { w.kv_v = argv[i + 1]; }
+    }
+    return w;
+}
+
+// Index of a flag's value in argv, or -1. The ladders patch their own value in
+// place: a second copy appended to argv would also be parsed, and whichever came
+// last would win by accident.
+//
+// It has to be the *last* copy. parse_args reads argv in order, so a repeated
+// flag is decided by its last occurrence; patching an earlier one leaves the
+// later copy deciding, and `-ncffn 4 -ncffn auto` then re-armed the ladder inside
+// its own children instead of probing them, since the patched "4" was overridden
+// by the "auto" that followed it.
+int value_index(int argc, char ** argv, const char * flag, const char * alias) {
+    for (int i = argc - 1; i >= 1; --i) {
+        const std::string a = argv[i];
+        if ((a == flag || a == alias) && i + 1 < argc) {
+            return i + 1;
+        }
+    }
+    return -1;
+}
+
+// Stage B of `-ncffn auto`: the card cannot hold every layer's attention, so no
+// FFN-on-CPU count makes the full stack fit and the answer is a smaller stack.
+int run_split_ladder(int argc, char ** argv, const std::string & model, const Device & gpu);
+
 // `-ncffn auto`: the smallest FFN-on-CPU count that still creates a context.
 //
 // In-process probing was rejected. A context that fails to allocate does not
@@ -662,23 +902,10 @@ void ladder_remember(const std::string & key, int n) {
 // winning rung then runs for real in its own child, so the numbers reported are
 // a clean process and the ladder never pays for two generations.
 int run_ffn_ladder(int argc, char ** argv, const std::string & model) {
-    // One message for a bad path beats sixty child processes each reporting it.
-    // The magic is checked for the same reason: a truncated download or an HTML
-    // error page saved as .gguf opens fine and then fails inside
-    // llama_model_load_from_file, which a probe has to report as "this rung does
-    // not fit" - so the ladder would climb all 64 rungs before admitting the
-    // file cannot be read. Whatever is wrong with those bytes, more FFN on the
-    // CPU will not fix it.
-    FILE * f = std::fopen(model.c_str(), "rb");
-    if (!f) {
-        std::fprintf(stderr, "error: cannot open %s: %s\n", model.c_str(), std::strerror(errno));
-        return 1;
-    }
-    char magic[4] = {0, 0, 0, 0};
-    const size_t got = std::fread(magic, 1, sizeof(magic), f);
-    std::fclose(f);
-    if (got != sizeof(magic) || std::memcmp(magic, "GGUF", 4) != 0) {
-        std::fprintf(stderr, "error: %s is not a GGUF file (or is truncated)\n", model.c_str());
+    // One message for a bad path beats sixty child processes each reporting it,
+    // and whatever is wrong with those bytes, more FFN on the CPU will not fix
+    // it.
+    if (!gguf_ok(model)) {
         return 1;
     }
 
@@ -695,39 +922,35 @@ int run_ffn_ladder(int argc, char ** argv, const std::string & model) {
         return 1;
     }
 
-    int want_ctx = 0;
-    std::string want_kv_k = "f16";
-    std::string want_kv_v;
-    for (int i = 1; i + 1 < argc; ++i) {
-        const std::string a = argv[i];
-        if (a == "-c") { want_ctx = std::atoi(argv[i + 1]); }
-        else if (a == "--kv") { want_kv_k = want_kv_v = argv[i + 1]; }
-        else if (a == "-ctk") { want_kv_k = argv[i + 1]; }
-        else if (a == "-ctv") { want_kv_v = argv[i + 1]; }
-    }
+    const Wanted wanted = scan_wanted(argc, argv);
     // The answer depends on the card as much as on the file (see ladder_key), so
-    // the parent reads the card from ggml's registry - the same source the fit
-    // uses - before deciding whether a remembered rung applies. This initialises
-    // the backends here; the children pay for that anyway, and no weight is
-    // loaded in this process.
+    // the card is read before deciding whether a remembered rung applies - and it
+    // is read from a child, never from this process: first_gpu() would initialise
+    // CUDA here, and the primary context that creates outlives
+    // llama_backend_free(), so every rung spawned below would be charged for it
+    // (see device_from_child). No weight is loaded in this process.
     llama_log_set(log_forward, nullptr);
-    llama_backend_init();
-    const Device gpu = first_gpu();
-    const std::string key = ladder_key(model, want_ctx, want_kv_k,
-                                       want_kv_v.empty() ? want_kv_k : want_kv_v, gpu);
+    const Device gpu = device_from_child();
+    const std::string key = ladder_key(model, wanted.ctx, wanted.kv_k, wanted.v_type(), gpu);
 
     std::vector<std::string> args(argv, argv + argc);
-    int first_rung = 1;
     // A remembered rung is confirmed, not trusted: the entry may predate another
     // process taking VRAM. A rung that no longer creates a context falls through
-    // to the climb below, which is also the direction a stale rung needs - a
+    // to the search below, which is also the direction a stale rung needs - a
     // card that shrank needs MORE FFN on the CPU, not less.
-    const int remembered = ladder_lookup(key);
-    if (remembered > 0) {
-        args[(size_t) value_idx] = std::to_string(remembered);
+    // One probe: patch the rung in place, ask a child to create the context, and
+    // report its exit code. The load happens in the child, so a rung that fails
+    // leaves nothing behind for the next one.
+    auto probe_rung = [&](int n) {
+        args[(size_t) value_idx] = std::to_string(n);
         std::vector<std::string> probe = args;
         probe.push_back("--ncffn-probe");
-        const int code = spawn_self(probe);
+        return spawn_self(probe);
+    };
+
+    const int remembered = ladder_lookup(key);
+    if (remembered > 0) {
+        const int code = probe_rung(remembered);
         if (code == 0) {
             std::fprintf(stderr,
                          "vipera: -ncffn auto reuses %d from the ladder memory\n"
@@ -742,28 +965,260 @@ int run_ffn_ladder(int argc, char ** argv, const std::string & model) {
                          remembered, code);
             return code;
         }
-        first_rung = remembered + 1;
     }
 
-    for (int n = first_rung; n <= FFN_LADDER_MAX; ++n) {
-        args[(size_t) value_idx] = std::to_string(n);
-        std::vector<std::string> probe = args;
-        probe.push_back("--ncffn-probe");
-        const int code = spawn_self(probe);
-        if (code == 0) {
-            ladder_remember(key, n);
-            std::fprintf(stderr, "vipera: -ncffn auto chose %d: the smallest count that\n"
-                                 "        creates a context at this -c\n", n);
-            return spawn_self(args);
-        }
-        if (code != PROBE_NO_CONTEXT) {
-            std::fprintf(stderr,
-                         "error: the probe at -ncffn %d exited %d, which is not an\n"
-                         "       out-of-VRAM failure; not climbing further\n", n, code);
-            return code;
-        }
+    // A mixed placement is only ever remembered after stage A failed at this same
+    // key (model, -c, KV type, card), so stage B is the answer here: re-running
+    // the bisection above would pay a spawn per rung to rediscover that nothing
+    // fits. If the card later grows, the remembered split still loads - it is
+    // conservative rather than wrong, and deleting the ladder file re-measures.
+    if (ladder_lookup("split|" + key) > 0) {
+        return run_split_ladder(argc, argv, model, gpu);
     }
-    std::fprintf(stderr, "error: no -ncffn up to %d created a context\n", FFN_LADDER_MAX);
+
+    // Bisection, not a climb: feasibility is monotone in the count (more FFN in
+    // RAM can only ask less of the card), so the smallest feasible value is found
+    // in log2(FFN_LADDER_MAX) rungs. The climb this replaced paid one spawn per
+    // step for the same answer and paid all 64 of them before admitting that
+    // nothing fits - which is the case the stage B fallback below exists for.
+    // A rung that just failed rules out every count below it.
+    const Bisect found = bisect_edge(remembered > 0 ? remembered + 1 : 1, FFN_LADDER_MAX,
+                                     Edge::Smallest, PROBE_NO_CONTEXT, [&](int n) {
+                                         std::fprintf(stderr,
+                                                      "vipera: -ncffn auto trying %d\n", n);
+                                         return probe_rung(n);
+                                     });
+    if (found.fatal_at > 0) {
+        std::fprintf(stderr,
+                     "error: the probe at -ncffn %d exited %d, which is not an\n"
+                     "       out-of-VRAM failure; not climbing further\n",
+                     found.fatal_at, found.fatal_code);
+        return found.fatal_code;
+    }
+    int best = found.value;
+    if (best > 0) {
+        // One rung can fail while the driver is still reclaiming the previous
+        // child's VRAM, which makes the bisection stop one layer high - and the
+        // value it stops on is the one that gets remembered. Measured: the search
+        // chose 7 on this card where 6 loads, then replayed 7 forever. Re-test the
+        // rung just below the winner, at most twice; a real wall fails again and
+        // costs one spawn.
+        for (int retry = 0; retry < 2 && best > 1; ++retry) {
+            if (probe_rung(best - 1) != 0) {
+                break;
+            }
+            --best;
+            std::fprintf(stderr, "vipera: -ncffn %d loads after all; taking the smaller split\n",
+                         best);
+        }
+        ladder_remember(key, best);
+        std::fprintf(stderr, "vipera: -ncffn auto chose %d: the smallest count that\n"
+                             "        creates a context at this -c\n",
+                     best);
+        args[(size_t) value_idx] = std::to_string(best);
+        return spawn_self(args);
+    }
+    std::fprintf(stderr,
+                 "vipera: no FFN-on-CPU count fits: this card cannot hold the attention of\n"
+                 "        every layer, so the stack itself has to shrink\n");
+    return run_split_ladder(argc, argv, model, gpu);
+}
+
+// `-ngl` ladder: the split the fit (or -ngl) asked for did not load, and the run
+// used to end there. On the reference 4 GB card 22 of 28 layers never load at
+// any margin while 21 decode at 15 t/s, so failing the load costs the whole run
+// instead of a few layers - and the fit that produced the number read metadata
+// only, so the same guess is being made twice.
+//
+// A failed context does not hand its VRAM back, which is why every rung is a
+// child process: vipera's Python ladder measured that after three failures on a
+// 4 GB card even a split ten layers smaller stops loading. `--ctx-probe` makes a
+// child stop the moment the context exists, so a rung costs one load and nothing
+// else; the winning rung then runs for real in the foreground, and every printed
+// number comes from a clean process.
+int run_ngl_ladder(int argc, char ** argv, const std::string & model, const Device & gpu,
+                   int failed_at) {
+    if (!gguf_ok(model)) {
+        return 1;
+    }
+    const Wanted wanted = scan_wanted(argc, argv);
+    const std::string key = "ngl|" + ladder_key(model, wanted.ctx, wanted.kv_k,
+                                                wanted.v_type(), gpu);
+    std::vector<std::string> args(argv, argv + argc);
+    // The children are ordinary runs, not ladder parents: zero the marker so a
+    // probe cannot re-enter this function from inside itself.
+    const int marker = value_index(argc, argv, "--ngl-ladder", "--ngl-ladder");
+    if (marker >= 0) {
+        args[(size_t) marker] = "0";
+    }
+
+    auto probe = [&](int n) {
+        std::vector<std::string> child = args;
+        child.push_back("-ngl");
+        child.push_back(std::to_string(n));
+        child.push_back("--ctx-probe");
+        return spawn_self(child);
+    };
+    auto run = [&](int n) {
+        std::vector<std::string> child = args;
+        child.push_back("-ngl");
+        child.push_back(std::to_string(n));
+        return spawn_self(child);
+    };
+
+    // A remembered rung is confirmed, not trusted: another process may have
+    // taken the card since it was measured. Only the rungs *below* it are
+    // skipped, and those are the cheap ones to redo anyway.
+    const int remembered = ladder_lookup(key);
+    if (remembered > 0 && remembered < failed_at && probe(remembered) == 0) {
+        std::fprintf(stderr,
+                     "vipera: -ngl ladder reuses %d from the ladder memory (confirmed at\n"
+                     "        this -c; delete %s to re-measure)\n",
+                     remembered, ladder_path().c_str());
+        return run(remembered);
+    }
+
+    // Feasibility is monotone in the layer count - fewer layers can only ask less
+    // of the card - so the ceiling is found by bisection in log2(failed_at)
+    // spawns. Fixed coarse steps were tried first and are wrong twice: they skip
+    // the answer (28 -> 27, 26, 25 fail, then "half" lands on 14/28, where 20/28
+    // is loadable and decodes 15.3 t/s against 14.1), and the value they find is
+    // the one that gets remembered.
+    const Bisect found = bisect_edge(1, failed_at - 1, Edge::Largest, PROBE_NO_CONTEXT,
+                                     [&](int n) {
+                                         std::fprintf(stderr,
+                                                      "vipera: -ngl %d did not fit; trying %d\n",
+                                                      failed_at, n);
+                                         return probe(n);
+                                     });
+    if (found.fatal_at > 0) {
+        // A bad model path reports the same thing on every rung; one error beats
+        // five identical ones.
+        std::fprintf(stderr,
+                     "error: the probe at -ngl %d exited %d, which is not an\n"
+                     "       out-of-VRAM failure; not walking further\n",
+                     found.fatal_at, found.fatal_code);
+        return found.fatal_code;
+    }
+    const int best = found.value;
+    if (best > 0) {
+        ladder_remember(key, best);
+        std::fprintf(stderr,
+                     "vipera: -ngl ladder chose %d: the most layers that still create a\n"
+                     "        context at this -c\n",
+                     best);
+        return run(best);
+    }
+    std::fprintf(stderr, "error: no -ngl from %d down to 1 created a context\n", failed_at);
+    return 1;
+}
+
+// Hand the -ngl climb to a fresh process.
+//
+// The process that ran the fit - or tried the context - still holds the CUDA
+// context it created (llama_backend_free() does not reclaim the primary one, see
+// device_from_child). Every rung spawned from here would be charged those bytes
+// and settle one layer low, then remember it. execv replaces this image, so the
+// new process has never touched the device and its children see the whole card.
+[[noreturn]] void relaunch_for_ladder(int argc, char ** argv, int failed_at) {
+    std::vector<std::string> args(argv, argv + argc);
+    args.push_back("--ngl-ladder");
+    args.push_back(std::to_string(failed_at));
+    std::vector<char *> av;
+    av.reserve(args.size() + 1);
+    for (const auto & a : args) {
+        av.push_back(const_cast<char *>(a.c_str()));
+    }
+    av.push_back(nullptr);
+    execv("/proc/self/exe", av.data());
+    std::fprintf(stderr, "error: cannot re-run this binary for the -ngl ladder: %s\n",
+                 std::strerror(errno));
+    _exit(127);
+}
+
+// Stage B of `-ncffn auto`, for a model whose attention alone does not fit.
+//
+// `-ncffn` keeps every layer's attention - and with it the KV slice - on the
+// card, so when that overflows, no FFN-on-CPU count can help: the missing bytes
+// are the ones the flag refuses to move. The answer is fewer layers on the card:
+// `-ngl M -ncffn M` puts the attention and KV of M layers in VRAM and reads the
+// FFN of those same M layers from RAM, which a classic `-ngl M` cannot do - it
+// would drag their FFN onto the card too and buy fewer layers for the same
+// bytes.
+//
+// There is no layer count to bisect against (the ladder still never loads the
+// model), so the search starts above any real stack and lets a probe reject it:
+// a count past the end asks for "every layer, every FFN in RAM", which is the
+// stage A rung that already failed.
+int run_split_ladder(int argc, char ** argv, const std::string & model, const Device & gpu) {
+    // Same pre-check as the other two ladders: a file that cannot be read is not
+    // a placement this search can find, and every rung would report it as "does
+    // not fit" (see gguf_ok).
+    if (!gguf_ok(model)) {
+        return 1;
+    }
+    const int ncffn_at = value_index(argc, argv, "-ncffn", "--n-cpu-ffn");
+    if (ncffn_at < 0) {
+        std::fprintf(stderr, "error: -ncffn auto needs the flag it belongs to\n");
+        return 1;
+    }
+    const Wanted wanted = scan_wanted(argc, argv);
+    const std::string key = "split|" + ladder_key(model, wanted.ctx, wanted.kv_k,
+                                                  wanted.v_type(), gpu);
+    std::vector<std::string> args(argv, argv + argc);
+
+    auto child = [&](int m, bool probe_only) {
+        std::vector<std::string> out = args;
+        out[(size_t) ncffn_at] = std::to_string(m);
+        out.push_back("-ngl");
+        out.push_back(std::to_string(m));
+        if (probe_only) {
+            out.push_back("--ctx-probe");
+        }
+        return out;
+    };
+
+    const int remembered = ladder_lookup(key);
+    if (remembered > 0 && spawn_self(child(remembered, true)) == 0) {
+        std::fprintf(stderr,
+                     "vipera: split ladder reuses %d layers from the ladder memory\n"
+                     "        (confirmed at this -c; delete %s to re-measure)\n",
+                     remembered, ladder_path().c_str());
+        return spawn_self(child(remembered, false));
+    }
+
+    // One override slot is kept for the terminator, and a rung above the cap exits
+    // with a hard error a probe would have to read as "does not fit" - so the
+    // search stops at the cap instead of asking for something the build cannot
+    // express.
+    const int max_ncffn = std::max(1, (int) llama_max_tensor_buft_overrides() - 1);
+    const int depth = gguf_block_count(model);
+    const int cap = depth > 0 ? std::min(depth, SPLIT_LADDER_MAX) : SPLIT_LADDER_MAX;
+    const int top = std::min(cap, max_ncffn);
+    const Bisect found = bisect_edge(1, top, Edge::Largest, PROBE_NO_CONTEXT, [&](int m) {
+        std::fprintf(stderr,
+                     "vipera: trying %d layers: attention and KV of those on the card,\n"
+                     "        their FFN in RAM\n",
+                     m);
+        return spawn_self(child(m, true));
+    });
+    if (found.fatal_at > 0) {
+        std::fprintf(stderr,
+                     "error: the probe at -ngl %d -ncffn %d exited %d, which is not an\n"
+                     "       out-of-VRAM failure; not walking further\n",
+                     found.fatal_at, found.fatal_at, found.fatal_code);
+        return found.fatal_code;
+    }
+    const int best = found.value;
+    if (best > 0) {
+        ladder_remember(key, best);
+        std::fprintf(stderr,
+                     "vipera: split ladder chose %d layers: attention and KV of those on the\n"
+                     "        card, their FFN in RAM, the rest of the stack on the CPU\n",
+                     best);
+        return spawn_self(child(best, false));
+    }
+    std::fprintf(stderr, "error: no layer count from 1 to %d fits this card\n", top);
     return 1;
 }
 
@@ -994,17 +1449,44 @@ int main(int argc, char ** argv) {
         print_usage(argv[0]);
         return 0;
     }
+    if (opt.device_only) {
+        // Answers the ladders' question without loading a weight. The context this
+        // creates dies with this process, which is the whole point.
+        llama_log_set(log_forward, nullptr);
+        llama_backend_init();
+        const Device d = first_gpu();
+        if (d.present) {
+            std::printf("%s|%zu|%zu\n", d.name.c_str(), d.total, d.free);
+        } else {
+            std::printf("none|0|0\n");
+        }
+        std::fflush(stdout);
+        llama_backend_free();
+        return 0;
+    }
 
     // A probe answers one question - does a context fit at this count - so the
     // plan-only exit must not answer it before the context is created.
-    if (opt.ffn_probe) {
+    if (opt.probe) {
         opt.plan_only = false;
+        // Its answer travels in the exit code and stderr. The plan and report it
+        // would otherwise print land in the parent's output once per rung, which
+        // reads as several contradictory plans for one run.
+        if (std::freopen("/dev/null", "w", stdout) == nullptr) {
+            return 1;
+        }
     }
 
     // `-ncffn auto` is resolved before any model work: the ladder re-runs this
     // binary per rung, so the parent never loads a weight itself.
     if (opt.ffn_auto) {
         return run_ffn_ladder(argc, argv, opt.model);
+    }
+    // The -ngl ladder runs in a process that was re-executed for it (see
+    // relaunch_for_ladder), so nothing here has a CUDA context to charge the
+    // rungs for. The card is read from a child, never from this process.
+    if (opt.ngl_ladder > 0) {
+        return run_ngl_ladder(argc, argv, opt.model, device_from_child(), opt.ngl_ladder);
     }
 
     const bool ffn_split = opt.n_cpu_ffn > 0;
@@ -1096,11 +1578,24 @@ int main(int argc, char ** argv) {
                          "error: this build holds %zu tensor overrides, so -ncffn caps at %d\n",
                          overrides.size() - 1, applied);
             llama_backend_free();
-            return 1;
+            // A probe reads "this placement cannot be expressed" as "does not
+            // fit", which is what lets a ladder bisect past the cap instead of
+            // aborting on it.
+            return opt.probe ? PROBE_NO_CONTEXT : 1;
         }
         model_params.tensor_buft_overrides = overrides.data();
-        model_params.n_gpu_layers = -1;
-        opt.ngl = -1;
+        // `-ncffn` on its own means "every layer's attention stays on the card",
+        // which is n_gpu_layers = -1. With an explicit -ngl the two form the
+        // fallback placement a card too small for that needs: M whole-layer
+        // slots with the FFN of those same M layers read from RAM. Forcing -1
+        // here would silently ignore the -ngl and fail exactly the case it was
+        // passed for.
+        if (opt.ngl < 0) {
+            model_params.n_gpu_layers = -1;
+            opt.ngl = -1;
+        } else {
+            model_params.n_gpu_layers = opt.ngl;
+        }
         if (opt.ctx == 0) {
             // Nothing fitted a context here, and the trained maximum assumes a
             // cache that fits beside 28 layers' attention on this card.
@@ -1155,12 +1650,20 @@ int main(int argc, char ** argv) {
 
     ModelPtr model(llama_model_load_from_file(opt.model.c_str(), model_params));
     if (!model) {
-        if (opt.ffn_probe) {
+        if (opt.probe) {
             // Too many FFN blocks on the card fails here rather than at the
             // context: llama.cpp cannot allocate the tensor buffers at load.
-            std::fprintf(stderr, "probe: -ncffn %d does not load\n", opt.n_cpu_ffn);
+            std::fprintf(stderr, "probe: the requested split does not load\n");
             llama_backend_free();
             return PROBE_NO_CONTEXT;
+        }
+        // A classic split too deep for the card fails here, not at the context:
+        // llama.cpp cannot allocate the tensor buffers at load. Walk it down
+        // instead of ending the run.
+        if (!ffn_split && opt.ngl > 0) {
+            std::fprintf(stderr, "error: %d layers do not load on this card\n", opt.ngl);
+            llama_backend_free();
+            relaunch_for_ladder(argc, argv, opt.ngl);
         }
         std::fprintf(stderr, "error: cannot load %s\n", opt.model.c_str());
         llama_backend_free();
@@ -1199,7 +1702,12 @@ int main(int argc, char ** argv) {
     } else {
         std::printf("  gpu            none (CPU only)\n");
     }
-    if (ffn_split) {
+    if (ffn_split && gpu_layers < n_layer) {
+        // The mixed fallback: only gpu_layers have their attention on the card,
+        // so "attention of all" would describe a different run than this one.
+        std::printf("  gpu layers     %d/%d (attention and KV of those, their FFN in RAM)\n",
+                    gpu_layers, n_layer);
+    } else if (ffn_split) {
         std::printf("  gpu layers     %d/%d (attention of all, FFN of %d from RAM)\n",
                     n_layer, n_layer, opt.n_cpu_ffn);
     } else if (!auto_placement) {
@@ -1217,7 +1725,10 @@ int main(int argc, char ** argv) {
                     gpu_layers, n_layer);
     }
     std::printf("  ram weights    ~%zu MiB of the model stays in system RAM\n", resident / MIB);
-    if (ffn_split) {
+    if (ffn_split && gpu_layers < n_layer) {
+        std::printf("  ffn on cpu     %d of the %d layers on the card, the other %d on the CPU\n",
+                    opt.n_cpu_ffn, gpu_layers, n_layer - gpu_layers);
+    } else if (ffn_split) {
         std::printf("  ffn on cpu     %d of %d layers read their FFN blocks from RAM\n",
                     opt.n_cpu_ffn, n_layer);
     }
@@ -1311,22 +1822,42 @@ int main(int argc, char ** argv) {
         }
     }
     if (!ctx) {
-        std::fprintf(stderr, "error: cannot create a context (%d tokens)", plan.ctx);
-        if (ffn_split) {
-            std::fprintf(stderr,
-                         "; free VRAM with a larger -ncffn, a smaller -c, or a quantized -ctk/-ctv");
+        const bool probe_child = opt.probe;
+        if (probe_child) {
+            // A probe rung reports "did not fit" in a way its ladder can read;
+            // every other failure exits 1 so the ladder stops instead of
+            // climbing.
+            std::fprintf(stderr, "probe: no %d-token context at this split\n", plan.ctx);
+        } else {
+            std::fprintf(stderr, "error: cannot create a context (%d tokens)", plan.ctx);
+            if (ffn_split) {
+                std::fprintf(stderr,
+                             "; free VRAM with a larger -ncffn, a smaller -c, or a quantized "
+                             "-ctk/-ctv");
+            }
+            std::fprintf(stderr, "\n");
         }
-        std::fprintf(stderr, "\n");
+        // Release everything this process holds before a ladder starts: a context
+        // that failed keeps its allocation, and a parent waiting on a child while
+        // sitting on its own CUDA context is charging the child for it.
+        model.reset();
         llama_backend_free();
-        // A probe rung reports "did not fit" in a way the ladder can read; every
-        // other failure stays a plain 1 so the ladder stops instead of climbing.
-        return opt.ffn_probe ? PROBE_NO_CONTEXT : 1;
+        if (probe_child) {
+            return PROBE_NO_CONTEXT;
+        }
+        if (!ffn_split && gpu_layers > 0) {
+            relaunch_for_ladder(argc, argv, gpu_layers);
+        }
+        return 1;
     }
 
     // The ladder only needs to know that a context exists at this count; the
     // prompt and the generation are the parent's job, in a clean process.
-    if (opt.ffn_probe) {
-        std::fprintf(stderr, "probe: -ncffn %d creates a %d-token context\n", opt.n_cpu_ffn, plan.ctx);
+    if (opt.probe) {
+        // No flag name: the -ngl ladder uses this same probe, and naming -ncffn
+        // there described a knob the run never had. The ladder above says which
+        // rung it is asking about.
+        std::fprintf(stderr, "probe: a %d-token context fits this split\n", plan.ctx);
         llama_backend_free();
         return 0;
     }

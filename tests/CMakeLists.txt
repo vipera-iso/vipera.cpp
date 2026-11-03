@@ -169,6 +169,9 @@ endif ()
 # the vipera tool's draft-acceptance scan: pure logic, no model needed
 llama_build_and_test(test-vipera-accept.cpp)
 
+# the vipera tool's placement bisection: pure logic, no model or GPU needed
+llama_build_and_test(test-vipera-place.cpp)
+
 # --spec must refuse a model whose cache cannot be rolled back, and finish the
 # run plainly. Skips (77) unless VIPERA_SPEC_RECURRENT_MODEL names such a model.
 if (NOT WIN32)
