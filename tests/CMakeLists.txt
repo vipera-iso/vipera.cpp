@@ -172,6 +172,10 @@ llama_build_and_test(test-vipera-accept.cpp)
 # the vipera tool's placement bisection: pure logic, no model or GPU needed
 llama_build_and_test(test-vipera-place.cpp)
 
+# the MoE expert cache's eviction policy, against a model of it: pure logic, no
+# model file or device needed
+llama_build_and_test(test-vipera-moe-cache-lru.cpp)
+
 # --spec must refuse a model whose cache cannot be rolled back, and finish the
 # run plainly. Skips (77) unless VIPERA_SPEC_RECURRENT_MODEL names such a model.
 if (NOT WIN32)
