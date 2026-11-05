@@ -20,6 +20,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <algorithm>
+#include <atomic>
 #include <unordered_map>
 #include <vector>
 
@@ -28,6 +29,18 @@
 #include <sys/sysctl.h>
 #endif
 
+
+// global knobs
+
+static std::atomic<int> g_repack_kquants{-1};
+
+void ggml_backend_repack_kquants_set(int mode) {
+    g_repack_kquants.store(mode, std::memory_order_relaxed);
+}
+
+int ggml_backend_repack_kquants_get(void) {
+    return g_repack_kquants.load(std::memory_order_relaxed);
+}
 
 // backend buffer type
 

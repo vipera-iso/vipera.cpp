@@ -458,6 +458,19 @@ extern "C" {
     GGML_API ggml_backend_buffer_t      ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size);
     GGML_API ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void);
 
+    //
+    // Global knobs
+    //
+
+    // Whether the CPU backend may repack the K-quant weights: -1 follows the tiled matmul (which
+    // is skipped while the weights are repacked, and is the faster of the two), 0 never, 1 always.
+    //
+    // Lives in ggml-base rather than in the CPU backend so that callers which only link the base
+    // library (libllama-common, for one) can set it even when the CPU backend is a library that is
+    // loaded at runtime (GGML_BACKEND_DL).
+    GGML_API void ggml_backend_repack_kquants_set(int mode);
+    GGML_API int  ggml_backend_repack_kquants_get(void);
+
 #ifdef  __cplusplus
 }
 #endif
