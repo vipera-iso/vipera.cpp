@@ -1,32 +1,56 @@
 {
-  "note": "median of 5 runs of ./build-cuda/bin/kernel-gate --rows 131072, CPU only, 131072x4096 mul_mat (220-570 MB weight, DRAM-resident), ~8 GB read per timed batch",
+  "note": "median of 5 runs of ./build-cuda/bin/kernel-gate --rows 131072, CPU only, 131072x4096 mul_mat (176-570 MB weight, DRAM-resident), ~8 GB read per timed batch",
   "date": "2026-11-05",
-  "host": "15 GiB VM, 4 threads, GGML_CUDA build; this op runs on CPU",
+  "host": "15 GiB VM, 4 threads, GGML_CUDA build; this op runs on CPU; measured read ceiling 45.4 GB/s",
   "spread_pct": {
-    "Q8_0": 1.7,
-    "Q4_K": 2.1,
-    "Q3_K": 4.4
+    "Q8_0": 0.4,
+    "Q4_K": 13.1,
+    "Q3_K": 3.0,
+    "Q2_K": 4.7,
+    "Q5_K": 6.2,
+    "Q6_K": 3.4
   },
   "rows": [
     {
       "quant": "Q8_0",
       "op": "mul_mat",
-      "gbs": 42.237,
+      "gbs": 43.097,
       "bytes": 570425344,
       "env": "cpu"
     },
     {
       "quant": "Q4_K",
       "op": "mul_mat",
-      "gbs": 40.717,
+      "gbs": 41.624,
       "bytes": 301989888,
       "env": "cpu"
     },
     {
       "quant": "Q3_K",
       "op": "mul_mat",
-      "gbs": 31.79,
+      "gbs": 32.011,
       "bytes": 230686720,
+      "env": "cpu"
+    },
+    {
+      "quant": "Q2_K",
+      "op": "mul_mat",
+      "gbs": 36.469,
+      "bytes": 176160768,
+      "env": "cpu"
+    },
+    {
+      "quant": "Q5_K",
+      "op": "mul_mat",
+      "gbs": 39.832,
+      "bytes": 369098752,
+      "env": "cpu"
+    },
+    {
+      "quant": "Q6_K",
+      "op": "mul_mat",
+      "gbs": 43.118,
+      "bytes": 440401920,
       "env": "cpu"
     }
   ]

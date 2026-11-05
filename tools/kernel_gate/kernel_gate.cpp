@@ -160,6 +160,9 @@ int main(int argc, char ** argv) {
         { GGML_TYPE_Q8_0, "Q8_0" },
         { GGML_TYPE_Q4_K, "Q4_K" },
         { GGML_TYPE_Q3_K, "Q3_K" },
+        { GGML_TYPE_Q2_K, "Q2_K" },
+        { GGML_TYPE_Q5_K, "Q5_K" },
+        { GGML_TYPE_Q6_K, "Q6_K" },
     };
 
     printf("# kernel-gate rows=%d cols=%d batch_bytes=%.0f threads=%d\n", N_ROWS, N_COLS, BATCH_BYTES, N_THREADS);
