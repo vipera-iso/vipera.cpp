@@ -180,6 +180,9 @@ llama_build_and_test(test-vipera-plan-json.cpp)
 # model file or device needed
 llama_build_and_test(test-vipera-moe-cache-lru.cpp)
 
+# the performance gate: median of three plus a strictly beaten delta, pure logic
+llama_build_and_test(test-vipera-gate.cpp)
+
 # --spec must refuse a model whose cache cannot be rolled back, and finish the
 # run plainly. Skips (77) unless VIPERA_SPEC_RECURRENT_MODEL names such a model.
 if (NOT WIN32)
