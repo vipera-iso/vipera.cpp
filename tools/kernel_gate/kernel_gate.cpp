@@ -21,18 +21,21 @@
 // for the number to be a DRAM number: at 4096 rows the Q4_K weight is 9.4 MB
 // and sits in an 8 MB L3, which is why it reads faster than the CPU can read
 // main memory. `--rows 131072` puts every type at 220-570 MB.
-static int N_ROWS = 4096;
-static const int N_COLS   = 4096;
+static int          N_ROWS      = 4096;
+static const int    N_COLS      = 4096;
 // Bytes one timed batch should read: enough to average out the timer, few
 // enough to keep a 570 MB weight from taking a minute per type.
 static const double BATCH_BYTES = 8e9;
-static const int ITERS    = 50;
-static const int WARMUP   = 3;
-static const int N_RUNS   = 3;
-static const int N_THREADS = 4;
+static const int    ITERS       = 50;
+static const int    WARMUP      = 3;
+static const int    N_RUNS      = 3;
+// Threads split the rows between them, so the count decides whether the run is
+// limited by memory or by the dequant work: a type that speeds up with more
+// threads is ALU bound, one that does not is waiting on DRAM.
+static int          N_THREADS   = 4;
 // Rows quantized for real, then repeated to fill the weight. 512 rows of 4096
 // floats is 8 MB, so a 570 MB weight does not first need a 2 GB float copy.
-static const int TILE_ROWS = 512;
+static const int    TILE_ROWS   = 512;
 
 // xorshift: the same weights every run, so two builds are comparable
 static float frand(uint32_t & s) {
@@ -49,19 +52,18 @@ struct result {
 };
 
 static bool bench_type(enum ggml_type type, const char * name, result & out) {
-    const size_t row_size = ggml_row_size(type, N_COLS);
-    const size_t nbytes   = row_size * (size_t) N_ROWS;
-    const int tile_rows   = std::min(TILE_ROWS, N_ROWS);
+    const size_t row_size  = ggml_row_size(type, N_COLS);
+    const size_t nbytes    = row_size * (size_t) N_ROWS;
+    const int    tile_rows = std::min(TILE_ROWS, N_ROWS);
 
     std::vector<float> src((size_t) tile_rows * N_COLS);
-    uint32_t seed = 12345;
+    uint32_t           seed = 12345;
     for (auto & f : src) {
         f = frand(seed);
     }
 
     std::vector<uint8_t> tile(row_size * (size_t) tile_rows);
-    if (ggml_quantize_chunk(type, src.data(), tile.data(), 0, tile_rows, N_COLS, nullptr) !=
-        tile.size()) {
+    if (ggml_quantize_chunk(type, src.data(), tile.data(), 0, tile_rows, N_COLS, nullptr) != tile.size()) {
         fprintf(stderr, "%s: quantization size mismatch\n", name);
         return false;
     }
@@ -72,9 +74,9 @@ static bool bench_type(enum ggml_type type, const char * name, result & out) {
     }
 
     struct ggml_init_params params = {
-        /*.mem_size   =*/ nbytes + 1024u * 1024u * 1024u,
-        /*.mem_buffer =*/ nullptr,
-        /*.no_alloc   =*/ false,
+        /*.mem_size   =*/nbytes + 1024u * 1024u * 1024u,
+        /*.mem_buffer =*/nullptr,
+        /*.no_alloc   =*/false,
     };
 
     struct ggml_context * ctx = ggml_init(params);
@@ -121,9 +123,9 @@ static bool bench_type(enum ggml_type type, const char * name, result & out) {
     // real cost. The protocol's median-3 is across processes, in compare.py.
     std::sort(runs.begin(), runs.end());
     const double best = runs.front();
-    out.name  = name;
-    out.bytes = nbytes;
-    out.gbs   = (double) nbytes * iters / best / 1e9;
+    out.name          = name;
+    out.bytes         = nbytes;
+    out.gbs           = (double) nbytes * iters / best / 1e9;
 
     ggml_free(ctx);
     return true;
@@ -139,8 +141,14 @@ int main(int argc, char ** argv) {
                 fprintf(stderr, "--rows needs a positive count\n");
                 return 2;
             }
+        } else if (strcmp(argv[i], "--threads") == 0 && i + 1 < argc) {
+            N_THREADS = atoi(argv[++i]);
+            if (N_THREADS < 1) {
+                fprintf(stderr, "--threads needs a positive count\n");
+                return 2;
+            }
         } else {
-            fprintf(stderr, "usage: %s [--rows N]\n", argv[0]);
+            fprintf(stderr, "usage: %s [--rows N] [--threads N]\n", argv[0]);
             return 2;
         }
     }
@@ -154,16 +162,15 @@ int main(int argc, char ** argv) {
         { GGML_TYPE_Q3_K, "Q3_K" },
     };
 
-    printf("# kernel-gate rows=%d cols=%d batch_bytes=%.0f threads=%d\n", N_ROWS, N_COLS,
-           BATCH_BYTES, N_THREADS);
+    printf("# kernel-gate rows=%d cols=%d batch_bytes=%.0f threads=%d\n", N_ROWS, N_COLS, BATCH_BYTES, N_THREADS);
 
     for (const auto & t : types) {
         result r;
         if (!bench_type(t.type, t.name, r)) {
             return 1;
         }
-        printf("{\"quant\":\"%s\",\"op\":\"mul_mat\",\"gbs\":%.3f,\"bytes\":%zu,\"env\":\"cpu\"}\n",
-               r.name, r.gbs, r.bytes);
+        printf("{\"quant\":\"%s\",\"op\":\"mul_mat\",\"gbs\":%.3f,\"bytes\":%zu,\"env\":\"cpu\"}\n", r.name, r.gbs,
+               r.bytes);
     }
     return 0;
 }
