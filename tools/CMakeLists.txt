@@ -18,6 +18,8 @@ else()
     add_subdirectory(gguf-split)
     add_subdirectory(imatrix)
     add_subdirectory(llama-bench)
+    # the gate a kernel change has to beat: bytes/second per quant type
+    add_subdirectory(kernel_gate)
     add_subdirectory(completion)
     add_subdirectory(perplexity)
     add_subdirectory(quantize)

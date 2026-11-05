@@ -1,0 +1,11 @@
+{
+  "note": "median of 5 runs of ./build-vipera/bin/kernel-gate, CPU only, 4096x4096 mul_mat, best-of-3 batches inside each run",
+  "date": "2026-11-05",
+  "host": "15 GiB VM, 4 threads, GGML_CUDA=on (this op runs on CPU)",
+  "spread_pct": {"Q8_0": 18.0, "Q4_K": 15.2, "Q3_K": 0.8},
+  "rows": [
+    {"quant": "Q8_0", "op": "mul_mat", "gbs": 52.596, "bytes": 17825792, "env": "cpu"},
+    {"quant": "Q4_K", "op": "mul_mat", "gbs": 65.030, "bytes": 9437184, "env": "cpu"},
+    {"quant": "Q3_K", "op": "mul_mat", "gbs": 41.608, "bytes": 7208960, "env": "cpu"}
+  ]
+}

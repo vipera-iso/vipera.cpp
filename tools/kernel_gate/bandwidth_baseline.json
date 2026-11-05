@@ -1,0 +1,19 @@
+{
+  "_comment": "Bandwidth ceilings measured by tools/kernel_gate/bandwidth_probe*. Rewrite by re-running the probes, never by hand.",
+  "_machine": "GTX 1650 4 GiB (spec 192 GB/s), i5-11300H, DDR4 dual channel, 15 GiB RAM",
+  "_command": {
+    "gpu_read_gbs": "build-cuda/bin/bandwidth-probe-cuda | grep gpu-read (median-3)",
+    "gpu_copy_gbs": "build-cuda/bin/bandwidth-probe-cuda | grep gpu-copy (median-3)",
+    "cpu_read_gbs": "build-cuda/bin/bandwidth-probe 4 | grep cpu-read (median-3)",
+    "cpu_copy_gbs": "build-cuda/bin/bandwidth-probe 4 | grep cpu-copy (median-3)"
+  },
+  "gpu_read_gbs": 188.647,
+  "gpu_copy_gbs": 172.845,
+  "cpu_read_gbs": 45.394,
+  "cpu_copy_gbs": 39.184,
+  "notes": [
+    "The GPU read kernel reaches 98% of the card's spec bandwidth, so the spec sheet is a fair ceiling for GPU work.",
+    "Decode on the 1.5B Q4_K_M model moves 1.117 GB per token: 104.42 t/s is 116.6 GB/s, i.e. 62% of gpu_read_gbs.",
+    "kernel-gate's 4096x4096 Q4_K weight is 9.4 MB against 8 MB of L3, so part of its 65 GB/s is cache; a DRAM-resident comparison needs a ~1 GB weight."
+  ]
+}
